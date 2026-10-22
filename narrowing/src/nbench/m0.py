@@ -87,7 +87,10 @@ async def run(out: Path, docs: int, reps: int) -> None:
     result: dict = {"environment": "hosted Atlas M0 (informational)", "documents": docs, "limits_stated": {
         "storage_gb": 0.5, "ops_per_s": 100, "harness_ops_per_s": MAX_OPS, "search_indexes": 3}}
     client = AsyncMongoClient(url, serverSelectionTimeoutMS=20000)
-    coll = client["hb_narrowing"][COLL]
+    # The database comes from HOODIE_BENCH_ATLAS_DB, else from the database named in the URL, else "bench". Only
+    # the collection named COLL (and its search index) is ever dropped.
+    db = client[os.environ.get("HOODIE_BENCH_ATLAS_DB") or client.get_default_database(default="bench").name]
+    coll = db[COLL]
     tc = Throttled(coll)
     try:
         await coll.drop()  # leftovers of a previous run
@@ -100,12 +103,12 @@ async def run(out: Path, docs: int, reps: int) -> None:
             await tc.insert_many(batch, ordered=False)
             loaded += len(batch)
             if loaded % 5000 == 0:
-                stats = await client["hb_narrowing"].command("dbStats")
+                stats = await db.command("dbStats")
                 if stats["dataSize"] + stats["indexSize"] > STORAGE_LIMIT:
                     print(f"M0: stopping load at {loaded} documents (80% of 0.5 GB)")
                     break
         await coll.create_index("rank")
-        stats = await client["hb_narrowing"].command("dbStats")
+        stats = await db.command("dbStats")
         result["loaded"] = loaded
         result["storage_bytes"] = stats["dataSize"] + stats["indexSize"]
         # --- one search index

@@ -7,6 +7,7 @@ Fixed-order stateful phases, each run alone and last: marker (long growth test),
 import asyncio
 import json
 import math
+import os
 import random
 import re
 import subprocess
@@ -628,8 +629,12 @@ async def phase_m0(ctx: Ctx, atlas_uri: str) -> None:
     d = ctx.phase_dir("m0")
     client = AsyncMongoClient(atlas_uri)
     lim = _Limiter(40.0)  # at most 40 operations per second (the cluster allows 100; the brief says stay under 50)
-    raw = client[DB]
-    name = "m0_entity"
+    # The database comes from HOODIE_BENCH_ATLAS_DB, else from the database named in the URL, else "bench". Only the
+    # collection `name` (and its search index) is dropped, and only this run's rows in the marker collection are
+    # deleted, so other data in that database is left alone.
+    dbname = os.environ.get("HOODIE_BENCH_ATLAS_DB") or client.get_default_database(default="bench").name
+    raw = client[dbname]
+    name = "hb_wp_m0_entity"
     out: dict = {"limits_note": "M0: 0.5 GB, 100 ops/s, 3 search indexes; harness throttled to 40 ops/s"}
     try:
         # Leftovers of a crashed run: the name is fixed, and M0 jobs never overlap (they share one concurrency
@@ -673,7 +678,8 @@ async def phase_m0(ctx: Ctx, atlas_uri: str) -> None:
             clauses[kind] = lo
         out["max_ok_documents_tested_ladder"] = clauses
         # time to searchable at <= 10 writes per second, with throttled commands
-        wp = WritePath(client, name, IndependentWaiter(Prober(coll, idx, "rev", "count", 500, 1), Schedule(100, 1.5, 500, 30)))
+        wp = WritePath(client, name, IndependentWaiter(Prober(coll, idx, "rev", "count", 500, 1), Schedule(100, 1.5, 500, 30)),
+                       db=dbname)
         wp.coll, wp.sync = coll, _TDB(raw, lim)[SYNC]
         tts = []
         for i in range(10 if ctx.smoke else 120):
