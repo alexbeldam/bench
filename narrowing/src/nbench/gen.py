@@ -9,7 +9,7 @@ import time
 
 import numpy as np
 from pymongo import AsyncMongoClient
-from pymongo.errors import OperationFailure
+from pymongo.errors import NotPrimaryError, OperationFailure
 from pymongo.operations import SearchIndexModel
 from tqdm import tqdm
 
@@ -140,7 +140,14 @@ async def prepare(uri: str, label: str, out: str, disk_path: str = "/") -> dict:
                 await asyncio.sleep(2)
         t0 = time.perf_counter()
         if not exists:
-            await coll.create_search_index(SearchIndexModel(definition=SEARCH_DEFINITION, name=name))
+            for attempt in range(90):  # the engine can still be restarting mongod after it first answered
+                try:
+                    await coll.create_search_index(SearchIndexModel(definition=SEARCH_DEFINITION, name=name))
+                    break
+                except (NotPrimaryError, OperationFailure) as e:
+                    if attempt == 89 or (isinstance(e, OperationFailure) and e.code not in (125, 11600)):
+                        raise
+                    await asyncio.sleep(2)
         await wait_queryable(coll, name, 6 * 3600)
         info["search_index_s"] = round(time.perf_counter() - t0, 1)
         info["free_after_index_bytes"] = free_bytes(disk_path)

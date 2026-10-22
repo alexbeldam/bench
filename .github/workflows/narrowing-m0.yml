@@ -29,6 +29,7 @@ jobs:
       cancel-in-progress: false
     defaults:
       run:
+        shell: bash
         working-directory: narrowing
     env:
       LABEL: ${{ inputs.label }}

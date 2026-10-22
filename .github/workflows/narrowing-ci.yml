@@ -19,6 +19,7 @@ jobs:
     timeout-minutes: 30
     defaults:
       run:
+        shell: bash
         working-directory: narrowing
     env:
       NAME: nbench-engine
@@ -74,6 +75,7 @@ jobs:
       cancel-in-progress: false
     defaults:
       run:
+        shell: bash
         working-directory: narrowing
     env:
       LABEL: smoke-ci-m0

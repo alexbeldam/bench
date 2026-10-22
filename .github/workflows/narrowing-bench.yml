@@ -81,6 +81,7 @@ jobs:
       actions: read
     defaults:
       run:
+        shell: bash
         working-directory: narrowing
     env:
       NAME: nbench-engine

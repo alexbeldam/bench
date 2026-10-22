@@ -59,6 +59,7 @@ env:
   SEED_ARG: ${{ inputs.seed != '' && format('--seed {0}', inputs.seed) || '' }}
 defaults:
   run:
+    shell: bash
     working-directory: write-path
 jobs:
   probe:
