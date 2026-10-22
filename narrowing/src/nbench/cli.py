@@ -113,7 +113,8 @@ def cmd_env(a) -> None:
 def cmd_m0(a) -> None:
     from .m0 import run
 
-    asyncio.run(run(run_dir(a.label), a.docs, a.reps))
+    if not asyncio.run(run(run_dir(a.label), a.docs, a.reps)):
+        raise SystemExit(1)  # a failed M0 task must show as a failed job, not a green one with an error in m0.json
 
 
 def cmd_project(a) -> None:

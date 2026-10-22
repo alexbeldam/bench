@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -75,12 +76,14 @@ class Throttled:
         return getattr(self._c, name)
 
 
-async def run(out: Path, docs: int, reps: int) -> None:
+async def run(out: Path, docs: int, reps: int) -> bool:
+    """Returns False when an M0 task or its cleanup failed (the caller turns that into a non-zero exit), True when
+    everything ran or the tasks were skipped because the secret is not set."""
     url = os.environ.get(ENV)
     if not url:
         (out / "m0_skipped.json").write_text(json.dumps({"skipped": True, "reason": f"{ENV} is not set"}))
         print(f"M0: {ENV} is not set; skipping every M0 task.")
-        return
+        return True
     p = urlparse(url)
     secrets = [url, p.password or "", unquote(p.password or ""), p.username or "", p.hostname or ""]
     secrets = [s for s in secrets if s]
@@ -187,3 +190,8 @@ async def run(out: Path, docs: int, reps: int) -> None:
         text = redact(json.dumps(result, indent=1), secrets)
         (out / "m0.json").write_text(text)
         print("M0 done; results written to m0.json (no connection details are stored)")
+    ok = "error" not in result and result.get("cleaned_up") is not False
+    if not ok:
+        # Already redacted above, so it is safe to show in the CI log.
+        print(f"M0 FAILED: {result.get('error') or result.get('cleanup_error')}", file=sys.stderr)
+    return ok
