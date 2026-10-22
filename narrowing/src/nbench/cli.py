@@ -75,7 +75,8 @@ async def cmd_load_test(a) -> None:
     canary = Canary(uri(), a.scale, out / f"canary_{a.scale}.jsonl")
     await canary.start()
     try:
-        await run_load(uri(), a.scale, SCALES[a.scale], out, a.container, rates, a.duration, a.seed, a.cooldown, [], canary)
+        await run_load(uri(), a.scale, SCALES[a.scale], out, a.container, rates, a.duration, a.seed, a.cooldown, [], canary,
+                       workers=a.workers)
     finally:
         await canary.stop()
 
@@ -169,6 +170,7 @@ def main() -> None:
     p.add_argument("--duration", type=float, default=30)
     p.add_argument("--cooldown", type=float, default=5)
     p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--workers", type=int, default=2, help="client worker processes sharing one global arrival schedule")
     p.set_defaults(fn=cmd_load_test, aio=True)
     p = sub.add_parser("limits", help="1,023 / 1,024 values in an `in` clause on _id")
     common(p)

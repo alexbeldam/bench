@@ -48,6 +48,10 @@ on:
         description: "Seconds per rate"
         required: true
         default: "30"
+      load_workers:
+        description: "Client worker processes for the load test (one Python process saturated at about 100 queries/s; the runner has 4 vCPU shared with the engine)"
+        required: true
+        default: "2"
       engine_cpus:
         description: "CPU limit of the engine container (the runner has 4 vCPU; the client needs the rest)"
         required: true
@@ -90,6 +94,7 @@ jobs:
       LOAD_TEST: ${{ inputs.load_test }}
       LOAD_RATES: ${{ inputs.load_rates }}
       LOAD_DURATION: ${{ inputs.load_duration }}
+      LOAD_WORKERS: ${{ inputs.load_workers }}
       ENGINE_CPUS: ${{ inputs.engine_cpus }}
       ENGINE_MEM: ${{ inputs.engine_mem }}
     steps:
@@ -176,7 +181,7 @@ jobs:
           for s in ${SCALES//,/ }; do
             case "$s" in 1m|10m)
               uv run nbench load-test --label "$LABEL" --scale "$s" --container "$NAME" --rates "$LOAD_RATES" \
-                --duration "$LOAD_DURATION" --seed "$SEED" 2>&1 | tee -a "results/$LABEL/load_test.log" ;;
+                --duration "$LOAD_DURATION" --workers "$LOAD_WORKERS" --seed "$SEED" 2>&1 | tee -a "results/$LABEL/load_test.log" ;;
             esac
           done
 
