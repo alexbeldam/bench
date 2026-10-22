@@ -34,10 +34,17 @@ async def run(a: argparse.Namespace) -> int:
                 rates=[int(x) for x in a.rates.split(",")], duration_s=a.duration, warm_s=a.warm, container=a.container)
     ctx.counter = CommandCounter()
     ctx.client = AsyncMongoClient(ctx.uri, event_listeners=[ctx.counter], maxPoolSize=100)
+    # The hosted Atlas phase talks only to the cluster named by HOODIE_BENCH_ATLAS_URL, so a run that has nothing
+    # but that phase must not need (or inspect) the local engine container.
+    only_m0 = names == ["m0"]
     try:
-        info = await ctx.client.admin.command("buildInfo")
-        engine = {"mongod": info.get("version")}
-        write_json(out / "environment.json", collect(a.container, engine))
+        if only_m0:
+            engine = {"mongod": "not used: hosted Atlas M0 phase only"}
+            write_json(out / "environment.json", collect(None, engine))
+        else:
+            info = await ctx.client.admin.command("buildInfo")
+            engine = {"mongod": info.get("version")}
+            write_json(out / "environment.json", collect(a.container, engine))
         write_json(out / "meta.json", {"run_id": run_id, "seed": seed, "scale": a.scale, "smoke": smoke,
                                        "documents": SCALES[a.scale], "phases": names, "reps": a.reps, "rtts": ctx.rtts,
                                        "rates": ctx.rates, "duration_s": a.duration, "warm_s": a.warm,
