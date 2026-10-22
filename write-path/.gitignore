@@ -1,3 +1,5 @@
 results/smoke-local/
 .venv/
 __pycache__/
+results/downloads/
+results/analysis-*/

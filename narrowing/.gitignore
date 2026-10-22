@@ -5,3 +5,5 @@ __pycache__/
 # Local smoke outputs: timings from a shared machine, not results.
 results/smoke-*/
 results/smoke-tables.md
+results/run*/
+results/tables.md
