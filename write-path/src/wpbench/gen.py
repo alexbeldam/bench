@@ -5,6 +5,7 @@ import time
 
 import numpy as np
 from pymongo import AsyncMongoClient
+from pymongo.errors import OperationFailure
 from pymongo.operations import SearchIndexModel
 
 from .common import DB, REV, SCALES, SEED, SYNC, check_disk, free_gb, doc_oid, entity_name, index_name, seed_rev
@@ -74,26 +75,48 @@ async def load(client: AsyncMongoClient, coll_name: str, n: int, label: str) -> 
     print(f"[{label}] loaded {n:,} docs in {time.perf_counter() - t0:.0f}s", flush=True)
 
 
+def _search_service_starting(e: Exception) -> bool:
+    # Right after the container answers, mongot may still be starting: the server cannot reach the search
+    # index management service yet. It is transient, unlike any other error.
+    return isinstance(e, OperationFailure) and "Search Index Management service" in str(e)
+
+
+async def _index_states(coll, name: str) -> list[dict]:
+    """The named index's state documents, waiting (up to about 3 minutes) for the search service to come up."""
+    for attempt in range(90):
+        try:
+            return [ix async for ix in await coll.list_search_indexes(name)]
+        except OperationFailure as e:
+            if not _search_service_starting(e) or attempt == 89:
+                raise
+            await asyncio.sleep(2)
+    return []
+
+
 async def wait_queryable(coll, name: str, timeout_s: float = 6 * 3600) -> float:
     t0 = time.perf_counter()
     while time.perf_counter() - t0 < timeout_s:
-        async for ix in await coll.list_search_indexes(name):
-            if ix.get("queryable"):
-                return time.perf_counter() - t0
+        if any(ix.get("queryable") for ix in await _index_states(coll, name)):
+            return time.perf_counter() - t0
         await asyncio.sleep(2)
     raise TimeoutError(f"search index {name} not queryable after {timeout_s:.0f}s")
 
 
 async def ensure_index(coll, name: str, definition: dict) -> float | None:
     """Create the search index if absent and wait until queryable. Returns the wait in seconds when it had to wait."""
-    exists = False
-    async for ix in await coll.list_search_indexes(name):
-        exists = True
-        if ix.get("queryable"):
-            return None
+    states = await _index_states(coll, name)
+    if any(ix.get("queryable") for ix in states):
+        return None
     t0 = time.perf_counter()
-    if not exists:
-        await coll.create_search_index(SearchIndexModel(definition=definition, name=name))
+    if not states:
+        for attempt in range(90):
+            try:
+                await coll.create_search_index(SearchIndexModel(definition=definition, name=name))
+                break
+            except OperationFailure as e:
+                if not _search_service_starting(e) or attempt == 89:
+                    raise
+                await asyncio.sleep(2)
     await wait_queryable(coll, name)
     return time.perf_counter() - t0
 

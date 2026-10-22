@@ -79,13 +79,16 @@ class Throttled:
 async def run(out: Path, docs: int, reps: int) -> bool:
     """Returns False when an M0 task or its cleanup failed (the caller turns that into a non-zero exit), True when
     everything ran or the tasks were skipped because the secret is not set."""
-    url = os.environ.get(ENV)
+    raw_url = os.environ.get(ENV) or ""
+    # A secret pasted with a trailing newline or spaces would end up inside the last URL option (for example
+    # w=majority followed by a newline, which the server rejects), so surrounding whitespace is stripped.
+    url = raw_url.strip()
     if not url:
         (out / "m0_skipped.json").write_text(json.dumps({"skipped": True, "reason": f"{ENV} is not set"}))
         print(f"M0: {ENV} is not set; skipping every M0 task.")
         return True
     p = urlparse(url)
-    secrets = [url, p.password or "", unquote(p.password or ""), p.username or "", p.hostname or ""]
+    secrets = [raw_url, url, p.password or "", unquote(p.password or ""), p.username or "", p.hostname or ""]
     secrets = [s for s in secrets if s]
     result: dict = {"environment": "hosted Atlas M0 (informational)", "documents": docs, "limits_stated": {
         "storage_gb": 0.5, "ops_per_s": 100, "harness_ops_per_s": MAX_OPS, "search_indexes": 3}}

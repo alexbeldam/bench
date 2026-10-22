@@ -76,7 +76,8 @@ async def run(a: argparse.Namespace) -> int:
             elif n == "failure":
                 await P.phase_failure(ctx, a.failure_timeout, a.failure_reps)
             elif n == "m0":
-                url = os.environ.get("HOODIE_BENCH_ATLAS_URL")
+                # Stripped: a secret saved with a trailing newline would end up inside the last URL option.
+                url = (os.environ.get("HOODIE_BENCH_ATLAS_URL") or "").strip()
                 if not url:
                     print("HOODIE_BENCH_ATLAS_URL not set: skipping the hosted Atlas (M0) phase", flush=True)
                     write_json(out / "m0" / "skipped.json", {"skipped": "HOODIE_BENCH_ATLAS_URL not set"})
