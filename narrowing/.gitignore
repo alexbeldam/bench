@@ -1,3 +1,7 @@
 .venv/
 __pycache__/
 *.pyc
+
+# Local smoke outputs: timings from a shared machine, not results.
+results/smoke-*/
+results/smoke-tables.md
