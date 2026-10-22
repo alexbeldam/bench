@@ -1,0 +1,86 @@
+name: write-path-smoke
+# Harness check on every push that touches the write-path benchmark: a few thousand documents, a few writes per
+# second, minutes. Its timings are NOT results.
+on:
+  push:
+    paths: ["write-path/**", ".github/workflows/write-path-*.yml"]
+  pull_request:
+    paths: ["write-path/**", ".github/workflows/write-path-*.yml"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: write-path
+    env:
+      WP_CONTAINER: hoodie-writepath
+      WPBENCH_RESULTS: ${{ github.workspace }}/write-path/results/smoke
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install uv and Python 3.12
+        run: |
+          pipx install uv==0.11.26
+          uv python install 3.12
+          uv sync
+      - name: Start the engine
+        run: scripts/ci-start-engine.sh
+        env:
+          WP_CPUS: "2"
+          WP_MEM: "6g"
+      - name: Smoke run
+        run: >
+          uv run wpbench run --scale smoke --run-id smoke --reps 1 --rates 5,10 --duration 6 --warm 2
+          --batch-sizes 1,100,1000,5000 --count-sizes 1,10,100,1000 --marker-minutes 0.3 --failure-timeout 2
+          --failure-reps 3 --container hoodie-writepath
+          --phases clauses,semantics,counts,shapes,latency,coalesce,marker,failure
+      - name: Analyze
+        run: |
+          uv run wpbench analyze results/smoke/smoke --out results/smoke/analysis
+          cat results/smoke/analysis/report-tables.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Finish
+        if: always()
+        run: scripts/ci-finish.sh results/smoke
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: write-path-smoke
+          path: write-path/results/smoke
+          retention-days: 7
+
+  # Hosted Atlas M0 on every push, in parallel with the local smoke job. It shares the concurrency group
+  # `m0-cluster` with every other M0 job in this repository, so M0 jobs queue instead of overlapping (the free
+  # cluster holds 0.5 GB, allows 100 operations per second and only 3 search indexes). The secret is available to
+  # runs of this repository only: GitHub does not pass secrets to pull requests from forks.
+  m0:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    concurrency:
+      group: m0-cluster
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: write-path
+    env:
+      WPBENCH_RESULTS: ${{ github.workspace }}/write-path/results/m0-ci
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install uv and Python 3.12
+        run: |
+          pipx install uv==0.11.26
+          uv python install 3.12
+          uv sync
+      - name: Hosted Atlas M0 (informational; skipped when the secret is not set)
+        run: uv run wpbench run --scale smoke --run-id m0 --phases m0 --rates 5
+        env:
+          HOODIE_BENCH_ATLAS_URL: ${{ secrets.HOODIE_BENCH_ATLAS_URL }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: write-path-smoke-m0
+          path: write-path/results/m0-ci
+          retention-days: 7
+          if-no-files-found: ignore

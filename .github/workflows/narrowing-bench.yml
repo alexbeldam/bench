@@ -1,0 +1,201 @@
+name: narrowing-bench
+
+# The real measurement. One dispatch = one label (one "run"), one or more scales, a list of phases.
+# Run it at least three times on different occasions with different labels (see narrowing/RUNBOOK.md).
+# GitHub-hosted job limit (GitHub documentation, "Actions limits"): 6 hours per job, 35 days per workflow run.
+# Artifact storage on a free plan is limited (500 MB per the same page): raw results are compressed JSON lines.
+
+on:
+  workflow_dispatch:
+    inputs:
+      label:
+        description: "Run label, becomes the results directory and artifact name (run1, run2, run3, ...)"
+        required: true
+        default: run1
+      scales:
+        description: "Comma list: smoke, 100k, 1m, 10m. Use '100k,1m' first; 10m only after the disk decision."
+        required: true
+        default: "100k,1m"
+      phases:
+        description: "Comma list of phases, or 'all'. Shuffled inside each phase; the load test is separate."
+        required: true
+        default: all
+      reps:
+        description: "Repetitions per case (rounds of the randomized block)"
+        required: true
+        default: "30"
+      noise_reps:
+        description: "Repetitions for the noise phase (cap-deciding cases); the brief asks for at least 100"
+        required: true
+        default: "200"
+      seed:
+        description: "Shuffle seed. Empty = the workflow run number, so every run differs and is logged"
+        required: false
+        default: ""
+      time_limit_min:
+        description: "Per phase and scale: stop at the next round boundary after this many minutes (0 = none). 7 phases x 2 scales x 15 min stays inside the 6 h job limit; use 25 for 10m alone"
+        required: true
+        default: "15"
+      load_test:
+        description: "Run the open-loop load test (only for the scales 1m and 10m)"
+        type: boolean
+        default: true
+      load_rates:
+        description: "Queries per second, ascending"
+        required: true
+        default: "25,50,100,150,200,300,400"
+      load_duration:
+        description: "Seconds per rate"
+        required: true
+        default: "30"
+      engine_cpus:
+        description: "CPU limit of the engine container (the runner has 4 vCPU; the client needs the rest)"
+        required: true
+        default: "3"
+      engine_mem:
+        description: "Memory limit of the engine container (the runner has 16 GB)"
+        required: true
+        default: "10g"
+      projection_run_id:
+        description: "Only for 10m: workflow run id of the 100k,1m run whose disk_projection.json gates this job"
+        required: false
+        default: ""
+      projection_label:
+        description: "Only for 10m: the label of that run (its artifact is narrowing-<label>)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: read
+      actions: read
+    defaults:
+      run:
+        working-directory: narrowing
+    env:
+      NAME: nbench-engine
+      LABEL: ${{ inputs.label }}
+      SCALES: ${{ inputs.scales }}
+      PHASES: ${{ inputs.phases }}
+      REPS: ${{ inputs.reps }}
+      NOISE_REPS: ${{ inputs.noise_reps }}
+      SEED: ${{ inputs.seed || github.run_number }}
+      LIMIT_MIN: ${{ inputs.time_limit_min }}
+      LOAD_TEST: ${{ inputs.load_test }}
+      LOAD_RATES: ${{ inputs.load_rates }}
+      LOAD_DURATION: ${{ inputs.load_duration }}
+      ENGINE_CPUS: ${{ inputs.engine_cpus }}
+      ENGINE_MEM: ${{ inputs.engine_mem }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc # v6.4.3
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked
+
+      - name: Disk and Docker at the start
+        run: |
+          mkdir -p "results/$LABEL"
+          { df -h /; docker version --format 'docker {{.Server.Version}}'; nproc; free -m; } | tee "results/$LABEL/runner_start.txt"
+          docker pull mongodb/mongodb-atlas-local:8.0
+          docker images --digests mongodb/mongodb-atlas-local | tee -a "results/$LABEL/runner_start.txt"
+
+      - name: Gate for 10m (disk projection from the 100k,1m run)
+        id: gate
+        if: contains(inputs.scales, '10m')
+        env:
+          PROJ_RUN: ${{ inputs.projection_run_id }}
+          PROJ_LABEL: ${{ inputs.projection_label }}
+        run: |
+          if [ -z "$PROJ_RUN" ] || [ -z "$PROJ_LABEL" ]; then
+            echo "::error::10m needs projection_run_id and projection_label (the 100k,1m run that wrote disk_projection.json)"; exit 1
+          fi
+          echo "run=$PROJ_RUN label=$PROJ_LABEL" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: contains(inputs.scales, '10m')
+        with:
+          name: narrowing-${{ inputs.projection_label }}
+          path: narrowing/projection
+          run-id: ${{ inputs.projection_run_id }}
+          github-token: ${{ github.token }}
+      - name: Read the decision
+        id: decision
+        if: contains(inputs.scales, '10m')
+        run: |
+          f=$(find projection -name disk_projection.json | head -n 1)
+          test -n "$f" || { echo "::error::disk_projection.json not found in the artifact"; exit 1; }
+          cat "$f" | tee -a "$GITHUB_STEP_SUMMARY"
+          if grep -q '"attempt": true' "$f"; then echo "attempt=true" >> "$GITHUB_OUTPUT"; else echo "attempt=false" >> "$GITHUB_OUTPUT"; fi
+      - name: 10m not attempted
+        if: contains(inputs.scales, '10m') && steps.decision.outputs.attempt != 'true'
+        run: |
+          echo "::warning::The disk projection says 10m does not fit. Not attempting it. Report 10m as not benchmarked."
+          echo "10m NOT attempted: projection below the minimum free space." >> "$GITHUB_STEP_SUMMARY"
+          echo "stop" > skip_all
+
+      - name: Start the engine
+        if: hashFiles('narrowing/skip_all') == ''
+        run: bash scripts/start-engine.sh "$NAME" 27102 "$ENGINE_CPUS" "$ENGINE_MEM"
+      - name: Environment record
+        if: hashFiles('narrowing/skip_all') == ''
+        run: uv run nbench env --label "$LABEL" --container "$NAME"
+
+      - name: Load data and build indexes (records peak disk use per scale)
+        if: hashFiles('narrowing/skip_all') == ''
+        run: |
+          uv run nbench load --label "$LABEL" --scale "$SCALES" --container "$NAME" | tee "results/$LABEL/load.log"
+          df -h / | tee -a "results/$LABEL/runner_start.txt"
+
+      - name: Disk projection for 10m (decides whether 10m is attempted)
+        if: hashFiles('narrowing/skip_all') == '' && contains(inputs.scales, '100k') && contains(inputs.scales, '1m')
+        run: |
+          uv run nbench project --runs "results/$LABEL" --out "results/$LABEL/disk_projection.json" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Engine limits on this runner
+        if: hashFiles('narrowing/skip_all') == ''
+        run: uv run nbench limits --label "$LABEL" --scale "${SCALES%%,*}"
+
+      - name: Measurement phases (randomized blocks, seed logged)
+        if: hashFiles('narrowing/skip_all') == ''
+        run: |
+          for s in ${SCALES//,/ }; do
+            uv run nbench run --label "$LABEL" --scale "$s" --phases "$PHASES" --reps "$REPS" --noise-reps "$NOISE_REPS" \
+              --seed "$SEED" --time-limit-min "$LIMIT_MIN" 2>&1 | grep -v '^$' | tee -a "results/$LABEL/run.log"
+            df -h / | tee -a "results/$LABEL/runner_start.txt"
+          done
+
+      - name: Open-loop load test (stateful, last, ascending rates)
+        if: hashFiles('narrowing/skip_all') == '' && inputs.load_test
+        run: |
+          for s in ${SCALES//,/ }; do
+            case "$s" in 1m|10m)
+              uv run nbench load-test --label "$LABEL" --scale "$s" --container "$NAME" --rates "$LOAD_RATES" \
+                --duration "$LOAD_DURATION" --seed "$SEED" 2>&1 | tee -a "results/$LABEL/load_test.log" ;;
+            esac
+          done
+
+      - name: Analysis tables into the job summary
+        if: always() && hashFiles('narrowing/skip_all') == ''
+        run: |
+          uv run nbench analyze --runs "results/$LABEL" --out "results/$LABEL/tables.md"
+          head -c 900000 "results/$LABEL/tables.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Engine log tail and final disk
+        if: always() && hashFiles('narrowing/skip_all') == ''
+        run: |
+          docker logs "$NAME" 2>&1 | tail -n 3000 | cut -c1-2000 > "results/$LABEL/engine.log.txt" || true
+          docker stats --no-stream "$NAME" | tee "results/$LABEL/engine_stats_end.txt" || true
+          df -h /
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: narrowing-${{ inputs.label }}
+          path: narrowing/results/${{ inputs.label }}
+          retention-days: 90
