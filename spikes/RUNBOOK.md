@@ -25,3 +25,15 @@ Artifact: `spike-probe-<occasion>-<group>`, raw `q*.json` and `q*.log` plus the 
 Known gaps in the harness (reported by its author): the marker-stream and capped-collection runs were inconclusive or crashed locally; after a leader kill every surviving node missed one event, cause unknown. Treat those as open, not as results.
 
 Not coverable here: hosted-cluster limits (five streams on a free cluster, no streams on Flex, operations per second), another server version (the search-index-on-a-view probe needs 8.1 or later). Those need the hosted-cluster job and, for views, a newer engine image.
+
+## spike-flakiness (`spikes/flakiness`, search engine image)
+
+| group | what | smallest input | real input | expected time |
+|---|---|---|---|---|
+| startup | image pull time, cold-start stages, workers sharing one engine (each with its own database and index) | `n=2 workers=1,2` | `n=15 workers=1,2,4,8` | under 20 min |
+| lag | write-to-searchable lag (10 ms polling) and delete-to-total-zero lag, one document per cycle | `n=5` | `n=400` | about 15 min |
+| stale | exact total right after a delete, plain and with the index process paused (SIGSTOP/SIGCONT) around the delete | `n=2` | `n=20` | under 30 min |
+| ghost | drop a collection while its search index exists, then recreate; three orders, 20 s bound | `n=1` | `n=10` | under 40 min |
+| ties | native tie order against sort {score, _id} over index builds | `n=2` | `n=4` | under 10 min |
+
+Artifact: `flakiness-<occasion>-<group>`. Group `startup` times the start itself and does not use the shared start script. Smoke-tested locally: lag, stale, ties, ghost. Group `startup` was not run before the first dispatch.
