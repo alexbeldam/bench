@@ -101,7 +101,7 @@ async def startup(name, port, out, workers, cycles):
     fails = 0
     while True:
         try:
-            await coll.insert_one({"_id": 1, "title": "key1 hello"})
+            await coll.replace_one({"_id": 1}, {"_id": 1, "title": "key1 hello"}, upsert=True)
             await coll.create_search_index(SearchIndexModel(definition=DEFN, name="i"))
             break
         except Exception as e:  # noqa: BLE001  writes can fail while mongod restarts; the index call fails until the engine connects
@@ -109,6 +109,7 @@ async def startup(name, port, out, workers, cycles):
             r.setdefault("first_error", f"{now()} {type(e).__name__}")
             await asyncio.sleep(0.25)
     r["engine_connected"] = now()
+    print("engine connected", r["engine_connected"], flush=True)
     r["retries_before_connected"] = fails
     await queryable(coll, "i")
     r["index_queryable"] = now()
@@ -132,6 +133,7 @@ async def startup(name, port, out, workers, cycles):
     for w in workers:
         outs = [{} for _ in range(w)]
         s = time.perf_counter()
+        print("workers", w, flush=True)
         await asyncio.gather(*(worker(f"{w}_{i}", outs[i]) for i in range(w)))
         wall = time.perf_counter() - s
         lags = [x for o in outs for x in o["lags"]]
