@@ -116,7 +116,14 @@ def _writer(pid, form, rate, dur, hot, t_start, outq):
         s = tgt - time.time()
         if s > 0: time.sleep(s)
         d = hot[k % len(hot)] if len(hot) == 1 else random.choice(hot)
-        r = co.find_one_and_update({"_id": d}, {"$inc": {"_hoodie_v": 1}, "$set": {"title": "w%d" % pid}}, projection={"_hoodie_v": 1}, return_document=True)
+        if form == "P3":
+            upd = [{"$set": {"_hoodie_v": {"$add": [{"$ifNull": ["$_hoodie_v", 0]}, 1]}, "title": "w%d" % pid}},
+                   {"$set": {"_hoodie_t": {"$let": {"vars": {"s": {"$toString": "$_id"}, "n": {"$toString": "$_hoodie_v"}},
+                             "in": {"$concat": [{"$toString": {"$strLenCP": "$$s"}}, ":", "$$s", ":",
+                                                {"$substrCP": ["0123456789abcdefghij", {"$strLenCP": "$$n"}, 1]}, "$$n"]}}}}}]
+        else:
+            upd = {"$inc": {"_hoodie_v": 1}, "$set": {"title": "w%d" % pid}}
+        r = co.find_one_and_update({"_id": d}, upd, projection={"_hoodie_v": 1}, return_document=True)
         with lock: pend.append([d, int(r["_hoodie_v"]), time.time()])
         res["writes"] += 1
         k += 1

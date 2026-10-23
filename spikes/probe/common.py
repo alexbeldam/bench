@@ -129,7 +129,7 @@ def q(coll, pipe):
 
 
 def count_idx(coll, name, path="_hoodie_v"):
-    r = q(coll, [{"$searchMeta": {"index": name, "range": {"path": path, "gte": -1}, "count": {"type": "total"}}}])
+    r = q(coll, [{"$searchMeta": {"index": name, "range": {"path": path, "gte": "0" if path == "_hoodie_t" else -1}, "count": {"type": "total"}}}])
     return r[0]["count"]["total"] if r else 0
 
 
