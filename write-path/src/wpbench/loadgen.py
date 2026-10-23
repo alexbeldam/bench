@@ -109,7 +109,7 @@ async def shard_main(spec: dict) -> dict:
         nonlocal rows_failed
         op = build(k)
         start = loop.time()
-        row = {"k": k, "shard": shard, "ts": wall0 + (sched - base), "warm": (sched - base) < warm,
+        row = {"k": k, "shard": shard, "doc": str(op.doc_id), "ts": wall0 + (sched - base), "warm": (sched - base) < warm,
                "lag_ms": round((start - sched) * 1000, 3)}
         try:
             res = await (wp.plain(op, txn) if variant == "plain" else wp.write(op, txn))
