@@ -2,6 +2,17 @@ name: spike-feed
 # Change-stream experiments on a plain replica set: streams per process, lazy open with replay, sharing between
 # processes, resume and error causes, memory of the event log. Dispatch one group at a time; see spikes/RUNBOOK.md.
 on:
+  workflow_call:
+    inputs:
+      group:
+        type: string
+        required: true
+      trials:
+        type: string
+        default: "10000"
+      occasion:
+        type: string
+        default: "run1"
   workflow_dispatch:
     inputs:
       group:

@@ -2,6 +2,23 @@ name: spike-probe
 # Version probe forms and delete-then-recreate rules against the search engine. Dispatch one group at a time;
 # see spikes/RUNBOOK.md. Every job has its own runner, engine and artifact.
 on:
+  workflow_call:
+    inputs:
+      group:
+        type: string
+        required: true
+      reps:
+        type: string
+        default: "10"
+      duration:
+        type: string
+        default: "30"
+      docs:
+        type: string
+        default: "1000000"
+      occasion:
+        type: string
+        default: "run1"
   workflow_dispatch:
     inputs:
       group:
