@@ -167,7 +167,7 @@ def p3(coll, name, pairs):
 
 def mongot_signal(sig):
     pid = subprocess.run(["docker", "exec", CN, "sh", "-c",
-                          "for p in /proc/[0-9]*; do if tr '\\0' ' ' < $p/cmdline 2>/dev/null | grep -q '/opt/mongot/bin/jdk/bin/java'; then basename $p; fi; done | head -1"],
+                          "for p in /proc/[0-9]*; do case \"$(readlink $p/exe 2>/dev/null)\" in */bin/java) basename $p;; esac; done | head -1"],
                          capture_output=True, text=True).stdout.strip()
     subprocess.run(["docker", "exec", CN, "kill", "-" + sig, pid], check=True)
     return pid
