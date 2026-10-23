@@ -135,7 +135,7 @@ async def main():
     async def tail_capped():
         _, last = await last_tok()
         while True:
-            cur = db.feed.find({"_id": {"$gt": last}}, cursor_type=CursorType.TAILABLE_AWAIT, max_await_time_ms=100)
+            cur = db.feed.find({"_id": {"$gt": last}}, cursor_type=CursorType.TAILABLE_AWAIT).max_await_time_ms(100)
             async for d in cur:
                 last = d["_id"]
                 rec(d["c"], d["d"], d["r"], "feed")
