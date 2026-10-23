@@ -1,0 +1,5 @@
+[project]
+name = "scf"
+version = "0"
+requires-python = ">=3.12,<3.13"
+dependencies = ["pymongo>=4.13", "redis>=5", "psutil"]
