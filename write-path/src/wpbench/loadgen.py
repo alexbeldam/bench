@@ -21,7 +21,7 @@ from pymongo import AsyncMongoClient
 
 from .cmdmon import CommandCounter
 from .common import DB, REV, index_name
-from .probe import SCHEDULES, Coalescer, IndependentWaiter, Prober, Schedule
+from .probe import SCHEDULES, Coalescer, IndependentWaiter, Prober, Schedule, Sentinel
 from .sim import Op, SyncFailure, WritePath
 
 POOL_FLAG = 1 << 62
@@ -46,6 +46,8 @@ def make_waiter(coll, index: str, spec: dict):
         sched = Schedule(sched.initial_ms, sched.factor, sched.max_ms, spec["timeout_s"])
     prober = Prober(coll, index, spec.get("shape", "rev"), spec.get("result", "count"), spec.get("chunk", 500),
                     spec.get("conc", 4))
+    if spec.get("coalesce") == "sentinel":
+        return Sentinel(prober, sched, spec.get("tick_ms", 10.0))
     return (Coalescer if spec.get("coalesce") else IndependentWaiter)(prober, sched)
 
 

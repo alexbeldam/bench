@@ -436,6 +436,15 @@ async def phase_coalesce(ctx: Ctx) -> None:
             cases[f"update_r{rate}_{'coalesced' if co else 'independent'}_{sched}"] = dict(
                 duration_s=ctx.duration_s, warm_s=ctx.warm_s, txn=False, op="update", variant="sim", mode="strong",
                 rate=rate, rtt=0.0, schedule=sched, coalesce=co)
+    for rt in sorted({10, 100} - {rate}):  # independent baselines at the lower rates
+        cases[f"update_r{rt}_independent_default"] = dict(
+            duration_s=ctx.duration_s, warm_s=ctx.warm_s, txn=False, op="update", variant="sim", mode="strong",
+            rate=rt, rtt=0.0, schedule="default", coalesce=False)
+    for rt in sorted({10, 100, rate}):  # sentinel poller: ticks are constant whatever the write rate
+        for tick in (10, 20):
+            cases[f"update_r{rt}_sentinel_t{tick}"] = dict(
+                duration_s=ctx.duration_s, warm_s=ctx.warm_s, txn=False, op="update", variant="sim", mode="strong",
+                rate=rt, rtt=0.0, schedule="default", coalesce="sentinel", tick_ms=tick, result="docs")
     await run_blocks(ctx, "coalesce", cases)
 
 

@@ -256,3 +256,80 @@ class Coalescer:
                 w.due = end + self.schedule.delay(w.k)
                 if not w.remaining:
                     self._finish(w, True)
+
+
+class Sentinel:
+    """A wait group that polls one cheap query per tick instead of re-checking every pending write.
+
+    Each tick checks only the oldest pending item (one clause). When that item is visible, one full pass verifies
+    every pending item by its revision, so a visibility batch costs one wide query and the tick rate stays constant
+    whatever the write rate. Reliability does not depend on the engine applying changes in order: a full pass also
+    runs at least every `fallback_ms`, and an item is released only when its own revision was seen.
+    """
+
+    def __init__(self, prober: Prober, schedule: Schedule, tick_ms: float = 10.0, fallback_ms: float = 250.0) -> None:
+        self.prober, self.schedule = prober, schedule
+        self.tick, self.fallback = tick_ms / 1000.0, fallback_ms / 1000.0
+        self._waiters: list[_Waiter] = []
+        self._task: asyncio.Task | None = None
+        self.ticks = self.full_passes = 0
+
+    async def wait(self, items: list[Item], t_start: float | None = None) -> WaitResult:
+        t0 = t_start if t_start is not None else time.perf_counter()
+        res = WaitResult(ok=False, remaining=list(items), started=t0)
+        w = _Waiter(list(items), t0 + self.schedule.timeout_s, asyncio.get_running_loop().create_future(), res, t0)
+        self._waiters.append(w)
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._poll())
+        await w.fut
+        return res
+
+    def _finish(self, w: _Waiter, ok: bool) -> None:
+        w.result.ok, w.result.remaining, w.result.ended = ok, [] if ok else w.remaining, time.perf_counter()
+        if w in self._waiters:
+            self._waiters.remove(w)
+        if not w.fut.done():
+            w.fut.set_result(None)
+
+    async def _poll(self) -> None:
+        last_full = 0.0
+        while self._waiters:
+            await asyncio.sleep(self.tick)
+            now = time.perf_counter()
+            for w in [w for w in self._waiters if w.deadline <= now]:
+                self._finish(w, False)
+            if not self._waiters:
+                return
+            oldest = self._waiters[0]
+            budget = max(0.05, oldest.deadline - now)
+            self.ticks += 1
+            try:
+                everyone = list(self._waiters)
+                # Two pending writes to one document: the older revision may be overwritten before the engine
+                # ever indexes it, so it can never be seen. The newest write per document stands for all of them.
+                newest: dict = {}
+                for w in everyone:
+                    for it in w.remaining:
+                        newest[it[0]] = it
+                sent = await self.prober.check([newest[oldest.remaining[0][0]]], budget)
+                queries, errors = sent.queries, sent.errors
+                if not sent.remaining or now - last_full >= self.fallback:
+                    self.full_passes += 1
+                    chk = await self.prober.check(list(newest.values()), budget)
+                    end = time.perf_counter()
+                    last_full = end
+                    left = set(chk.remaining)
+                    queries, errors = queries + chk.queries, errors + chk.errors
+                    for w in everyone:
+                        w.result.attempts.append((now, end, len(w.remaining)))
+                        w.result.queries += queries
+                        w.result.errors += errors
+                        w.remaining = [it for it in w.remaining if newest[it[0]] in left]
+                        if not w.remaining:
+                            self._finish(w, True)
+                else:
+                    oldest.result.queries += queries
+                    oldest.result.errors += errors
+            except ProbeShapeError:
+                for w in list(self._waiters):
+                    self._finish(w, False)

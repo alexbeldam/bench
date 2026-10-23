@@ -8,7 +8,7 @@ on:
         description: "Which job group to run (stateful groups marker and failure run last, each alone)"
         type: choice
         default: probe
-        options: [probe, latency, marker, failure, m0]
+        options: [probe, latency, coalesce, marker, failure, m0]
       scale:
         description: "Documents per entity"
         type: choice
@@ -96,6 +96,26 @@ jobs:
           uv run wpbench run --scale ${{ inputs.scale }} --run-id "$RUN_ID" $SEED_ARG --reps ${{ inputs.reps }}
           --rtts "${{ inputs.rtts }}" --rates "${{ inputs.rates }}" --duration ${{ inputs.duration }}
           --warm ${{ inputs.warm }} --container hoodie-writepath --phases latency
+      - run: scripts/ci-finish.sh "$WPBENCH_RESULTS"
+        if: always()
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: write-path-${{ env.RUN_ID }}
+          path: write-path/results/out
+  coalesce:
+    if: inputs.group == 'coalesce'
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: pipx install uv==0.11.26 && uv python install 3.12 && uv sync
+      - run: scripts/ci-start-engine.sh
+      - name: Probe wait groups: independent, shared and sentinel polling
+        run: >
+          uv run wpbench run --scale ${{ inputs.scale }} --run-id "$RUN_ID" $SEED_ARG --reps ${{ inputs.reps }}
+          --rtts "${{ inputs.rtts }}" --rates "${{ inputs.rates }}" --duration ${{ inputs.duration }}
+          --warm ${{ inputs.warm }} --container hoodie-writepath --phases coalesce
       - run: scripts/ci-finish.sh "$WPBENCH_RESULTS"
         if: always()
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
