@@ -127,11 +127,13 @@ jobs:
           chmod +x containers.sh; ./containers.sh main; sleep 10
           ./containers.sh solo; ./containers.sh auth
       - name: Connection kill and resume
+        timeout-minutes: 20
         run: |
           uv run python exp4.py auto
           uv run python exp4.py manual
           uv run python exp4.py outage
       - name: Why a stream cannot open
+        timeout-minutes: 20
         run: |
           uv run python exp5.py causes
           uv run python exp5.py pool

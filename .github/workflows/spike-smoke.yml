@@ -8,6 +8,9 @@ on:
     paths: ["spikes/probe/**", "spikes/feed/**", "write-path/scripts/**", ".github/workflows/spike-*.yml"]
 permissions:
   contents: read
+concurrency:
+  group: spike-smoke-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   probe:
     strategy:
@@ -20,6 +23,7 @@ jobs:
       reps: "1"
       duration: "10"
       docs: "100000"
+      scenarios: same_young,new_old
       occasion: smoke-ci
   feed:
     strategy:

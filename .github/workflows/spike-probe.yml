@@ -4,6 +4,9 @@ name: spike-probe
 on:
   workflow_call:
     inputs:
+      scenarios:
+        type: string
+        default: "same_young,same_old,same_old_stall,new_old,new_old_stall,same_slow_control"
       group:
         type: string
         required: true
@@ -21,6 +24,10 @@ on:
         default: "run1"
   workflow_dispatch:
     inputs:
+      scenarios:
+        description: "Scenarios (group recreate)"
+        type: string
+        default: "same_young,same_old,same_old_stall,new_old,new_old_stall,same_slow_control"
       group:
         description: "Which job group to run"
         type: choice
@@ -65,7 +72,7 @@ jobs:
       - name: Rules A, A2, B, C on same-id and new-id recreate
         run: >
           uv run python q3.py ${{ inputs.reps }}
-          same_young,same_old,same_old_stall,new_old,new_old_stall,same_slow_control ${{ inputs.occasion }}
+          ${{ inputs.scenarios }} ${{ inputs.occasion }}
         timeout-minutes: 200
       - name: Finish
         if: always()
