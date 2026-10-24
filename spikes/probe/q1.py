@@ -1,5 +1,5 @@
 """Q1: probe forms P1..P3 per id type: correctness, clause limit, latency, wrong mappings."""
-import random, statistics
+import random, statistics, sys
 from common import *
 
 N = 3000
@@ -118,3 +118,8 @@ for kind in ("oid", "str", "uuid", "int"):
 out["slept"] = g.done()
 save("q1.json", out)
 print("slept", out["slept"])
+bad = [(k, f) for k, K in out["kinds"].items() for f, F in K["forms"].items()
+       if F["ok"]["error"] or F["ok"]["false_hit"] or F["ok"]["false_miss"] or any(isinstance(v, str) for v in F["lat"].values())]
+if bad:
+    print("FAILED with the correct mapping:", bad)
+    sys.exit(1)

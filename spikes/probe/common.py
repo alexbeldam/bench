@@ -5,7 +5,7 @@ from bson.binary import Binary, UuidRepresentation
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
-MAXMS = None
+MAXMS = 30000
 URI = "mongodb://127.0.0.1:27212/?directConnection=true"
 CN = "hoodie-s2-engine"
 RES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
