@@ -1,0 +1,67 @@
+name: spike-fl2-mech-pytest
+on:
+  workflow_dispatch:
+    inputs:
+      occasion:
+        description: occasion label
+        default: run1
+      phase:
+        description: 1 (cold), 2 (after a source change), 3 (after a data file change); phase 3 is the last
+        default: "1"
+permissions:
+  contents: read
+  actions: write
+defaults:
+  run:
+    shell: bash
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      OCC: ${{ inputs.occasion }}
+      PH: ${{ inputs.phase }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: bash spikes/flakiness2/mechanics/harness/env.sh
+      - name: Restore the test caches
+        id: c
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            spikes/flakiness2/mechanics/proj/.pytest_cache
+            spikes/flakiness2/mechanics/proj/.testmondata
+          key: mech-${{ inputs.occasion }}-p${{ inputs.phase }}-${{ github.run_id }}
+          restore-keys: mech-${{ inputs.occasion }}-p
+      - name: Install pinned plugins
+        run: |
+          python3 -m venv /tmp/v
+          /tmp/v/bin/pip install -q pytest==9.1.1 pytest-repeat==0.9.4 pytest-flakefinder==1.1.0 pytest-randomly==5.0.0 pytest-testmon==2.2.0 pytest-xdist==3.8.0 2>&1 | tail -3
+          /tmp/v/bin/pip freeze | tee /tmp/freeze.txt
+      - name: Run the measurements
+        env:
+          CACHE_MATCHED: ${{ steps.c.outputs.cache-matched-key }}
+        run: python3 spikes/flakiness2/mechanics/harness/harness.py /tmp/v/bin/python /tmp/out "$PH"
+      - name: Save the test caches
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            spikes/flakiness2/mechanics/proj/.pytest_cache
+            spikes/flakiness2/mechanics/proj/.testmondata
+          key: mech-${{ inputs.occasion }}-p${{ inputs.phase }}-${{ github.run_id }}
+      - name: Summary
+        if: always()
+        run: |
+          cp /tmp/freeze.txt /tmp/out/ 2>/dev/null || true
+          gzip -f /tmp/out/*.log 2>/dev/null || true
+          ls -la /tmp/out
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: fl2-mech-pytest-${{ inputs.occasion }}-p${{ inputs.phase }}
+          path: /tmp/out
+          retention-days: 90
+      - name: Dispatch the next phase
+        if: inputs.phase != '3'
+        run: gh workflow run spike-fl2-mech-pytest.yml -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f occasion="$OCC" -f phase=$((PH + 1))

@@ -1,0 +1,19 @@
+name: spike-fl2-mech-conc
+on:
+  pull_request:
+    branches: [fl2-mech-base]
+permissions:
+  contents: read
+concurrency:
+  group: mech-conc-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+defaults:
+  run:
+    shell: bash
+jobs:
+  long:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: |
+          for i in $(seq 1 18); do echo "tick $i"; sleep 5; done
