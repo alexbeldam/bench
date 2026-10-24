@@ -20,6 +20,7 @@ Artifact: `spike-probe-<occasion>-<group>`, raw `q*.json` and `q*.log` plus the 
 | lazy | open a stream after the write at the write's own operation time; negative control; quiet-server open latency | `trials=500` | `trials=10000` | under 1 h |
 | share | own streams, leader through a capped collection, leader through Redis (with and without killing the leader), marker stream | default | default | 1 to 2 h |
 | resume | kill the stream connection and resume (automatic and manual); exact server errors for a standalone server, a missing privilege and open-cursor limits | default | default | 1 to 2 h |
+| diag | `outage` and `redis kill` with and without keeping the event the first read after a resume returns; lists the missing events | default | default | under 15 min |
 | memory | bytes per event-log entry; live consumer at 500 and 1000 writes/s | default | default | under 1 h |
 
 Known gaps in the harness (reported by its author): the marker-stream and capped-collection runs were inconclusive or crashed locally; after a leader kill every surviving node missed one event, cause unknown. Treat those as open, not as results.

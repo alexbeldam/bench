@@ -1,5 +1,6 @@
-"""Q3: sharing prototypes. usage: exp3.py MODE [kill] [marker] -- MODE own|capped|redis|marker."""
-import asyncio, json, sys, time, collections
+"""Q3: sharing prototypes. usage: exp3.py MODE [kill] [marker] [keep] -- MODE own|capped|redis|marker.
+(keep: nodes keep the event the first read after opening a stream returns; otherwise it is dropped)"""
+import asyncio, json, os, sys, time, collections
 from common import *
 
 COLLS = ["e0", "e1", "e2"]
@@ -61,11 +62,13 @@ def check(ref, ev):
             bad += 1
         last[(c, d)] = max(p, last.get((c, d), -1))
     lats = [t - rev_us(ObjectId(r)) for _, _, r, t in ev]
-    return {"events": len(ev), "missing": miss, "duplicates": dup, "unknown": extra, "out_of_order": bad, "lat": lat(lats)}
+    mids = [{"ref_index": k, "key": list(kk)} for kk, k in pos.items() if kk not in seen][:5]
+    return {"events": len(ev), "missing": miss, "missing_events": mids, "duplicates": dup, "unknown": extra, "out_of_order": bad, "lat": lat(lats)}
 
 
-def main(mode, kill, marker, rate=200, dur=24):
-    tag = f"{mode}{'_kill' if kill else ''}{'_marker' if marker else ''}"
+def main(mode, kill, marker, keep=False, rate=200, dur=24):
+    tag = f"{mode}{'_kill' if kill else ''}{'_marker' if marker else ''}{'_keep' if keep else ''}"
+    os.environ["KEEP_FIRST"] = "1" if keep else ""
     asyncio.run(prep(mode))
     cl = ",".join(COLLS)
     ref = spawn("node.py", "ref", "own", f"results/_n_ref.txt", cl)
@@ -131,4 +134,4 @@ def main(mode, kill, marker, rate=200, dur=24):
 
 if __name__ == "__main__":
     a = sys.argv[1:]
-    main(a[0], "kill" in a, "marker" in a)
+    main(a[0], "kill" in a, "marker" in a, "keep" in a)

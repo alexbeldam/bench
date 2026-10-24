@@ -1,4 +1,5 @@
-"""Q4: kill the stream's connection during a hot-document run and resume. usage: exp4.py auto|manual"""
+"""Q4: kill the stream's connection during a hot-document run and resume. usage: exp4.py auto|manual|outage|outage_keep
+(outage_keep keeps the event the first read after a resume returns; the other kinds drop it)"""
 import asyncio, json, sys, time
 from pymongo.errors import PyMongoError
 from common import *
@@ -9,12 +10,16 @@ COLLS = ["e0", "e1", "e2"]
 
 
 async def main(kind):
+    keep = kind.endswith("_keep")
+    kind = kind.removesuffix("_keep")
+    name = "outage_keep" if keep else kind
     c = client(); db = c[DB]
     await seed(c, COLLS, 5)
     px = Proxy(27213); await px.start()
     pc = client(f"mongodb://127.0.0.1:{px.port}/?directConnection=true", serverSelectionTimeoutMS=3000)
     rdb = pc[DB]
     ref, got, errs, resumes = [], [], [], []
+    n_err = []
     stop = False
 
     async def refrun():
@@ -53,6 +58,7 @@ async def main(kind):
             ev = await s.try_next()
         except PyMongoError as e:
             t_err = time.time()
+            n_err.append(len(got))
             errs.append({"t_after_kill_s": round(t_err - killed_at, 2), "type": type(e).__name__, "code": getattr(e, "code", None), "msg": str(e)[:200]})
             # manual resume with the last event's token, retried every 0.5 s until it works, 20 s at most; the outage ends inside this loop
             while True:
@@ -64,8 +70,12 @@ async def main(kind):
                     break
                 try:
                     s = await rdb.watch(pipe(COLLS), resume_after=tok, max_await_time_ms=100) if tok else await rdb.watch(pipe(COLLS), max_await_time_ms=100)
-                    await s.try_next()
-                    resumes.append({"seconds_from_error_to_open": round(time.time() - t_err, 3)})
+                    first = await s.try_next()
+                    resumes.append({"seconds_from_error_to_open": round(time.time() - t_err, 3), "first_read_returned_event": first is not None})
+                    if first is not None and keep:
+                        cc, d, r = ev_rev(first)
+                        tok = first["_id"]
+                        got.append((cc, d, str(r), now_us()))
                     break
                 except PyMongoError as e2:
                     errs.append({"retry_error": type(e2).__name__, "msg": str(e2)[:120]})
@@ -86,9 +96,12 @@ async def main(kind):
     ts = [t for *_, t in got]
     gaps = [(b - a, a) for a, b in zip(ts, ts[1:])]
     mg = max(gaps)
-    out = {"kind": kind, "reference_events": len(ref), "node": check(ref, got), "errors_seen": errs[:6], "n_errors": len(errs), "manual_resumes": resumes,
+    pos = {k: i for i, (c, d, r, _) in enumerate(ref) for k in [(c, d, r)]}
+    seen = {(c, d, r) for c, d, r, _ in got}
+    miss = [{"ref_index": i, "coll": k[0], "doc": k[1], "rev": k[2]} for k, i in pos.items() if k not in seen]
+    out = {"kind": name, "missing_events": miss[:5], "received_before_error": n_err[:3], "reference_events": len(ref), "node": check(ref, got), "errors_seen": errs[:6], "n_errors": len(errs), "manual_resumes": resumes,
            "max_delivery_gap_ms": round(mg[0] / 1e3, 1), "gap_starts_s_after_kill": round(mg[1] / 1e6 - killed_at, 2),
            "severed_sockets": severed, "driver_auto_resume": kind == "auto", "guard": gd}
-    print(json.dumps(out)); save(f"exp4_{kind}", out)
+    print(json.dumps(out)); save(f"exp4_{name}", out)
 
 asyncio.run(main(sys.argv[1]))

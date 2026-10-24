@@ -1,6 +1,6 @@
 """Q3 node process. Modes: own (one db-level stream in this process), marker (one stream on the sync-marker collection),
 capped / redis (leader elected through a lease document; the leader holds the one stream and republishes, every node tails)."""
-import asyncio, json, sys, time
+import asyncio, json, os, sys, time
 
 from pymongo import CursorType
 from pymongo.errors import DuplicateKeyError
@@ -8,6 +8,7 @@ from pymongo.errors import DuplicateKeyError
 from common import *
 
 name, mode, out, colls = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4].split(",")
+KEEP = bool(os.environ.get("KEEP_FIRST"))
 TTL = float(sys.argv[5]) if len(sys.argv) > 5 else 3.0
 SYNC = "_sync"
 buf, nrec = [], 0
@@ -48,8 +49,7 @@ async def main():
             s = await db[SYNC].watch(pipe(None, ops=("insert", "update", "replace")), max_await_time_ms=100, **kw)
         else:
             s = await db.watch(pipe(colls), max_await_time_ms=100, **kw)
-        await s.try_next()
-        return s
+        return s, await s.try_next()
 
     def parse(ev):
         coll, doc, rev = ev_rev(ev)
@@ -71,8 +71,10 @@ async def main():
 
     async def publisher(gen):
         tok, seq = await last_tok()
-        s = await open_stream(tok)
+        s, first = await open_stream(tok)
         q = asyncio.Queue()
+        if KEEP and first is not None:
+            q.put_nowait(first)
         if gen is not None:
             gen.append(time.time())
 
@@ -152,7 +154,11 @@ async def main():
                     rec(f[b"c"].decode(), f[b"d"].decode(), f[b"r"].decode(), "feed")
 
     async def own_stream():
-        s = await open_stream(None)
+        s, first = await open_stream(None)
+        if KEEP and first is not None:
+            cc, dd, rv = parse(first)
+            if rv is not None:
+                rec(cc, dd, rv, "direct")
         while True:
             ev = await s.try_next()
             if ev is not None:
