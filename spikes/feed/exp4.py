@@ -73,7 +73,7 @@ async def main(kind):
             continue
         if ev is not None:
             cc, d, r = ev_rev(ev)
-            tok = ev["_id"]["_data"]
+            tok = ev["_id"]
             got.append((cc, d, str(r), now_us()))
             if killed_at and first_after is None and time.time() > killed_at:
                 first_after = time.time()
