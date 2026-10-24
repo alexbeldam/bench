@@ -1,0 +1,25 @@
+name: spike-fl2-mech-diff
+on:
+  pull_request:
+    branches: [fl2-mech-base]
+permissions:
+  contents: read
+  pull-requests: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  diff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR: ${{ github.event.pull_request.number }}
+      BASE: ${{ github.base_ref }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+      - run: spikes/flakiness2/mechanics/harness/env.sh
+      - name: Time the changed file lists
+        run: python3 spikes/flakiness2/mechanics/harness/diff.py

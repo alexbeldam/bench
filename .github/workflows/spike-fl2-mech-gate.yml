@@ -1,0 +1,58 @@
+name: spike-fl2-mech-gate
+on:
+  pull_request:
+    branches: [fl2-mech-base-b, fl2-mech-base-c]
+  merge_group:
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.d.outputs.code }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - run: spikes/flakiness2/mechanics/harness/env.sh
+      - id: d
+        env:
+          BASE: ${{ github.base_ref }}
+        run: |
+          files=$(git diff --name-only "origin/$BASE...HEAD" || true)
+          echo "$files"
+          if echo "$files" | grep -q '^spikes/flakiness2/mechanics/proj/src/'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+  heavy:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: |
+          sleep 10
+          if grep -rq FAIL_MARK spikes/flakiness2/mechanics/proj/src; then
+            echo "marker found"
+            exit 1
+          fi
+  gate:
+    needs: [changes, heavy]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - env:
+          R_CHANGES: ${{ needs.changes.result }}
+          R_HEAVY: ${{ needs.heavy.result }}
+        run: |
+          echo "changes=$R_CHANGES heavy=$R_HEAVY"
+          [ "$R_CHANGES" = success ] || exit 1
+          [ "$R_HEAVY" = success ] || [ "$R_HEAVY" = skipped ] || exit 1
