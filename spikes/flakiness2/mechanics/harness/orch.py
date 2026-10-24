@@ -25,7 +25,11 @@ def now():
 
 
 def sh(args, cwd=None, check=True):
-    p = subprocess.run(args, cwd=cwd, capture_output=True, text=True, encoding="utf-8")
+    for _ in range(4):
+        p = subprocess.run(args, cwd=cwd, capture_output=True, text=True, encoding="utf-8")
+        if not p.returncode or "error connecting" not in p.stderr:
+            break
+        time.sleep(5)
     if check and p.returncode:
         raise RuntimeError(f"{args}: {p.stderr}")
     return p
@@ -43,7 +47,11 @@ def api(method, path, body=None):
     args = ["gh", "api", "-X", method, path]
     if body is not None:
         args += ["--input", "-"]
-    p = subprocess.run(args, input=json.dumps(body) if body is not None else None, capture_output=True, text=True, encoding="utf-8")
+    for _ in range(4):
+        p = subprocess.run(args, input=json.dumps(body) if body is not None else None, capture_output=True, text=True, encoding="utf-8")
+        if not p.returncode or "error connecting" not in p.stderr:
+            break
+        time.sleep(5)
     return dict(rc=p.returncode, out=p.stdout[:1500], err=p.stderr[:1500])
 
 
