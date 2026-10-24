@@ -34,6 +34,8 @@ class Proxy:
         self.conns.difference_update([w, tw])
 
     def sever(self):
+        n = len(self.conns)
         for w in list(self.conns):
             w.transport.abort()
         self.conns.clear()
+        return n

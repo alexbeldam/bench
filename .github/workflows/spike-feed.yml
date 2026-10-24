@@ -130,6 +130,7 @@ jobs:
         run: |
           uv run python exp4.py auto
           uv run python exp4.py manual
+          uv run python exp4.py outage
       - name: Why a stream cannot open
         run: |
           uv run python exp5.py causes

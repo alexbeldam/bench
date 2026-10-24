@@ -33,6 +33,7 @@ async def main(kind):
     t0 = time.time()
     tok = None
     killed_at = None
+    severed = None
     down_until = None
     last_ev_t = time.time()
     first_after = None
@@ -44,7 +45,7 @@ async def main(kind):
             if kind == "outage":
                 px.paused = True
                 down_until = now + 3
-            px.sever()
+            severed = px.sever()
         if down_until and now > down_until:
             px.paused = False
             down_until = None
@@ -81,7 +82,7 @@ async def main(kind):
     mg = max(gaps)
     out = {"kind": kind, "reference_events": len(ref), "node": check(ref, got), "errors_seen": errs[:6], "n_errors": len(errs), "manual_resumes": resumes,
            "max_delivery_gap_ms": round(mg[0] / 1e3, 1), "gap_starts_s_after_kill": round(mg[1] / 1e6 - killed_at, 2),
-           "driver_auto_resume": kind == "auto", "guard": gd}
+           "severed_sockets": severed, "driver_auto_resume": kind == "auto", "guard": gd}
     print(json.dumps(out)); save(f"exp4_{kind}", out)
 
 asyncio.run(main(sys.argv[1]))
