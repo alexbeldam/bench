@@ -1,0 +1,50 @@
+name: spike-fl2-cost-smoke
+# Harness check on every push that touches the cost harness: every group at tiny scale. Its timings are NOT results.
+on:
+  push:
+    paths: ["spikes/flakiness2/**", ".github/workflows/spike-fl2-cost*.yml"]
+  workflow_dispatch:
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+    working-directory: spikes/flakiness2/suite
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      IMAGE: mongodb/mongodb-atlas-local:8.0
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: pipx install uv==0.11.26 && uv python install 3.12 && uv sync
+      - run: docker pull $IMAGE >/dev/null
+      - name: Suite group
+        run: uv run python ../cost/cost.py suite ../cost/results/suite.json --label suite --cpus 3,0 --workers 0,2 --reps 1 -k "s01 or s20 or tx_commit"
+      - name: Cpu2 group
+        run: uv run python ../cost/cost.py suite ../cost/results/cpu2.json --label cpu2 --pin 2 --cpus 2 --workers 0,2 --reps 1 -k "s01 or s20 or tx_commit"
+      - name: Model group
+        run: uv run python ../cost/cost.py model ../cost/results/model.json --workers 0,2 --reps 1 --s 8 --m 20 --fast-ms 20
+      - run: python3 ../cost/cost.py mark ../cost/results/image.jsonl restore_start
+      - id: r
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: /tmp/fl2-image
+          key: fl2-smoke-image-v1
+      - run: python3 ../cost/cost.py mark ../cost/results/image.jsonl restore_end hit=${{ steps.r.outputs.cache-hit == 'true' }}
+      - name: Image group on a small image
+        env:
+          IMAGE: alpine:3.20
+          SKIP_ENGINE: "1"
+        run: python3 ../cost/cost.py image ../cost/results/image.jsonl --hit ${{ steps.r.outputs.cache-hit == 'true' }} --key fl2-smoke-image-v1
+      - if: steps.r.outputs.cache-hit != 'true'
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: /tmp/fl2-image
+          key: fl2-smoke-image-v1
+      - name: Analyze
+        run: uv run python ../cost/cost.py analyze ../cost/results --out ../cost/results/analysis
+      - name: Finish
+        if: always()
+        run: docker rm -f hoodie-fl2-cost >/dev/null 2>&1 || true

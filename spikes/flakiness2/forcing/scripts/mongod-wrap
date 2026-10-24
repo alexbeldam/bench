@@ -1,0 +1,5 @@
+#!/bin/bash
+# Starts mongod with the arguments the container runner passes; adds test commands when FL_TEST_COMMANDS=1.
+extra=()
+[ "${FL_TEST_COMMANDS:-}" = 1 ] && extra=(--setParameter enableTestCommands=1)
+exec /usr/bin/mongod "$@" "${extra[@]}"

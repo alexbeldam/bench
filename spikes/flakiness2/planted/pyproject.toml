@@ -1,0 +1,33 @@
+[project]
+name = "fl2p"
+version = "0.1.0"
+description = "Planted-flake strategy benchmark"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "fl2-suite",
+  "beanie==2.2.0",
+  "pymongo>=4.13",
+  "numpy>=2.0",
+  "mongomock",
+  "mongomock-motor",
+  "pytest",
+  "pytest-randomly",
+  "pytest-repeat",
+  "hypothesis",
+]
+
+[project.scripts]
+fl2p = "fl2p.cli:main"
+
+[tool.uv.sources]
+fl2-suite = { path = "../suite" }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fl2p"]
+
+[tool.pytest.ini_options]
+testpaths = ["pytest_suite"]
