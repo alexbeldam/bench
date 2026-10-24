@@ -16,36 +16,69 @@ def cmd_registry(a: Any) -> None:
     print(json.dumps([t.label() for t in REG.values()], indent=1))
 
 
-def cmd_calib(a: Any) -> None:
-    """Timing-race failure rate against its margin, baseline and under stress, to show why the planted margin was chosen."""
+def calibrate(arms: list[str], margins: list[float], n: int, seed: int) -> list[dict[str, Any]]:
+    """Timing-race failure count against its margin, per arm. Each margin is run as a pool with a few micro tests interleaved, the
+    same arrangement as the pools of the noise job, so the rates are comparable with them."""
     from . import tests_misc
 
+    tr = REG["timing-race"]
+    mix = [REG[x] for x in ("c-sort", "c-json", "c-heap", "c-regex", "c-gather")]
     rows = []
-    t = REG["timing-race"]
-    for ar in a.arms.split(","):
-        with arm(ar):
-            for m in [float(x) for x in a.margins.split(",")]:
-                tests_misc.MARGIN_S = m / 1000.0
-                fails = sum(not run_one(t, Ctx()).ok for _ in range(a.n))
-                rows.append({"arm": ar, "margin_ms": m, "n": a.n, "fails": fails})
-                print(f"calib arm={ar} margin={m}ms {fails}/{a.n}", flush=True)
+    old = tests_misc.MARGIN_S
+    try:
+        for ar in arms:
+            with arm(ar):
+                for m in margins:
+                    tests_misc.MARGIN_S = m / 1000.0
+                    p = pool([tr] + mix, {t.name: n for t in [tr] + mix}, seed)
+                    fails = p["tests"]["timing-race"]["fail"].count("1")
+                    rows.append({"arm": ar, "margin_ms": m, "n": n, "fails": fails})
+                    print(f"calib arm={ar} margin={m}ms {fails}/{n}", flush=True)
+    finally:
+        tests_misc.MARGIN_S = old
+    return rows
+
+
+def choose_margin(rows: list[dict[str, Any]], target: float = 0.05) -> tuple[float | None, str]:
+    """The margin whose failure rate under stress100 is closest to `target` (and not zero). None when no margin failed."""
+    st = [r for r in rows if r["arm"] == "stress100" and r["fails"] > 0]
+    if not st:
+        return None, "no margin produced a failure under stress100; the default margin is kept"
+    best = min(st, key=lambda r: abs(r["fails"] / r["n"] - target))
+    return best["margin_ms"], f"closest stress100 rate to {target:.0%}: {best['fails']}/{best['n']} at {best['margin_ms']} ms"
+
+
+def cmd_calib(a: Any) -> None:
+    """Timing-race failure rate against its margin, baseline and under stress."""
+    rows = calibrate(a.arms.split(","), [float(x) for x in a.margins.split(",")], a.n, seed_or_new(getattr(a, "seed", None)))
     dump(a.out, {**header("calib", 0), "rows": rows})
 
 
 def cmd_noise(a: Any) -> None:
-    """S4: each arm gets a pool (every test, the timing race with a larger n) and K single suite passes."""
+    """S4: calibrate the timing-race margin on this machine, then each arm gets a pool (every test, the timing race with a larger n)
+    and K single suite passes."""
+    from . import tests_misc
+
     seed = seed_or_new(a.seed)
     out_dir = Path(a.out_dir)
+    rows = calibrate(["base", "stress100"], [float(x) for x in a.calib_margins.split(",")], a.calib_n, seed)
+    margin, why = choose_margin(rows)
+    if margin is not None:
+        tests_misc.MARGIN_S = margin / 1000.0
+    t_tr = REG["timing-race"]
+    t_tr.note = f"thread sets a flag after {tests_misc.PROD_S * 1000:.0f} ms, loop checks after +{tests_misc.MARGIN_S * 1000:.2f} ms (calibrated in this job)"
+    dump(out_dir / "calib-noise.json", {**header("calib", seed, margin_ms=tests_misc.MARGIN_S * 1000, chosen=why), "rows": rows})
+    print(f"noise margin {tests_misc.MARGIN_S * 1000:.2f} ms: {why}", flush=True)
     for ar in a.arms.split(","):
         with arm(ar):
             tests = [t for t in selected("all") if t.kind not in ("order-dep", "helper")]
-            sizes = pool_sizes(tests, a.n, a.budget)
+            sizes = pool_sizes(tests, a.n, a.budget, det_budget_s=a.det_budget)
             sizes["timing-race"] = a.race_n
             print(f"noise arm={ar} runs={sum(sizes.values())}", flush=True)
             p = pool(tests, sizes, seed)
             s = suite_exps("s0", a.k, seed)
-        dump(out_dir / f"noise-pool-{ar}.json.gz", {**p, **header("pool", seed, arm=ar, n=a.n, budget=a.budget)})
-        dump(out_dir / f"noise-suite-{ar}.json", {**header("suite", seed, strategy="s0", passes=1, k=a.k, arm=ar), "exps": s})
+        dump(out_dir / f"noise-pool-{ar}.json.gz", {**p, **header("pool", seed, arm=ar, n=a.n, budget=a.budget, margin_ms=tests_misc.MARGIN_S * 1000)})
+        dump(out_dir / f"noise-suite-{ar}.json", {**header("suite", seed, strategy="s0", passes=1, k=a.k, arm=ar, margin_ms=tests_misc.MARGIN_S * 1000), "exps": s})
 
 
 def cmd_smoke(a: Any) -> None:
@@ -58,7 +91,7 @@ def cmd_smoke(a: Any) -> None:
     out = Path(a.out_dir)
     ns = argparse.Namespace
     t0 = time.time()
-    cmd_pool(ns(seed=1, tests="all", extra="timing-race=60", arm="base", n=60, budget=5.0, out=str(out / "pool-base.json.gz")))
+    cmd_pool(ns(seed=1, tests="all", extra="timing-race=60", arm="base", n=60, budget=5.0, det_budget=8.0, out=str(out / "pool-base.json.gz")))
     for st, passes in (("s0", 1), ("s1", 1), ("s1", 3)):
         cmd_suite(ns(seed=2, strategy=st, k=6, passes=passes, arm="base", out=str(out / f"suite-{st}-p{passes}-base.json")))
     cmd_suite(ns(seed=3, strategy="s1", k=4, passes=3, arm="jitter", out=str(out / "suite-s5j-jitter.json")))
@@ -66,8 +99,7 @@ def cmd_smoke(a: Any) -> None:
     for sc in ("function", "session"):
         cmd_repeat(ns(scope=sc, k=2, nmax=12, out=str(out / f"repeat-{sc}.json")))
     cmd_prop(ns(seed=4, k=2, examples=15, steps=8, out=str(out / "prop.json")))
-    cmd_noise(ns(seed=5, arms="base,cpus2,stress100", n=40, budget=3.0, race_n=60, k=3, out_dir=str(out)))
-    cmd_calib(ns(arms="base", margins="1.0", n=30, out=str(out / "calib.json")))
+    cmd_noise(ns(seed=5, arms="base,cpus2,stress100,jitter", n=40, budget=3.0, det_budget=4.0, race_n=60, k=3, calib_margins="0.5,1.0", calib_n=20, out_dir=str(out)))
     cmd_pytestcost(ns(seed=6, ns=[1, 5], reps=1, out=str(out / "pytestcost.json")))
     cmd_pytestcheck(ns(seed=7, seeds=3, out=str(out / "pytestcheck.json")))
     analyze([str(out)], str(out / "report"))
@@ -87,7 +119,7 @@ def main() -> None:
 
     add("registry", cmd_registry)
     add("pool", cmd_pool, tests=dict(default="all"), extra=dict(default=""), arm=dict(default="base"), n=dict(type=int, default=9000),
-        budget=dict(type=float, default=45.0), seed=dict(type=int), out=dict(required=True))
+        budget=dict(type=float, default=45.0), det_budget=dict(type=float, default=150.0), seed=dict(type=int), out=dict(required=True))
     add("suite", cmd_suite, strategy=dict(choices=["s0", "s1"], default="s0"), k=dict(type=int, default=100), passes=dict(type=int, default=1),
         arm=dict(default="base"), seed=dict(type=int), out=dict(required=True))
     add("forced", cmd_forced, k=dict(type=int, default=30), out=dict(required=True))
@@ -95,9 +127,10 @@ def main() -> None:
     from .prop import cmd_prop
 
     add("prop", cmd_prop, k=dict(type=int, default=30), examples=dict(type=int, default=50), steps=dict(type=int, default=12), seed=dict(type=int), out=dict(required=True))
-    add("noise", cmd_noise, arms=dict(default="base,cpus2,stress50,stress100,cpus2+stress100"), n=dict(type=int, default=1500), budget=dict(type=float, default=20.0),
+    add("noise", cmd_noise, arms=dict(default="base,cpus2,stress50,stress100,cpus2+stress100,jitter"), n=dict(type=int, default=1500), budget=dict(type=float, default=6.0),
+        det_budget=dict(type=float, default=25.0), calib_margins=dict(default="0.25,0.5,1.0,2.0,4.0"), calib_n=dict(type=int, default=2000),
         race_n=dict(type=int, default=5000), k=dict(type=int, default=60), seed=dict(type=int), out_dir=dict(required=True))
-    add("calib", cmd_calib, arms=dict(default="base,stress100"), margins=dict(default="0.25,0.5,1.0,2.0"), n=dict(type=int, default=3000), out=dict(required=True))
+    add("calib", cmd_calib, arms=dict(default="base,stress100"), margins=dict(default="0.25,0.5,1.0,2.0"), n=dict(type=int, default=3000), seed=dict(type=int), out=dict(required=True))
     from .real import cmd_real
 
     add("real", cmd_real, shard=dict(required=True), workers=dict(type=int, default=4), n_scale=dict(choices=["smoke", "full"], default="full"),

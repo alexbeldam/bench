@@ -15,17 +15,21 @@ on:
         type: string
         default: "run1"
       reps:
-        description: "Repetitions inside the job (suite and cpu2: 3, model: 2)"
+        description: "Repetitions inside the job (empty: suite and cpu2 3, model 2)"
         type: string
-        default: "3"
+        default: ""
       seed:
         description: "Seed for the randomised order of arms"
         type: string
         default: "1"
       workers:
-        description: "xdist worker counts, 0 means no xdist (suite and cpu2: 0,1,2,4,8, model: 0,2,4,8)"
+        description: "xdist worker counts, 0 means no xdist (empty: suite and cpu2 0,1,2,4,8, model 0,2,4,8,12,16)"
         type: string
-        default: "0,1,2,4,8"
+        default: ""
+      pins:
+        description: "Group model: CPU emulation arms, 0 is the whole 4 vCPU runner, 2 is the 2 CPU emulation (for example 0,2)"
+        type: string
+        default: "0"
       key:
         description: "Cache key (group image)"
         type: string
@@ -106,7 +110,7 @@ jobs:
           s=$(date +%s.%N); docker pull $IMAGE >/dev/null; e=$(date +%s.%N)
           echo "pull_s=$(echo "$e - $s" | bc)" | tee ../cost/results/pull.txt
       - name: Real suite on one shared engine with and without a CPU limit
-        run: uv run python ../cost/cost.py suite ../cost/results/suite.json --label suite --cpus 3,0 --workers ${{ inputs.workers }} --reps ${{ inputs.reps }} --seed ${{ inputs.seed }}
+        run: uv run python ../cost/cost.py suite ../cost/results/suite.json --label suite --cpus 3,0 ${{ inputs.workers && format('--workers {0}', inputs.workers) || '' }} ${{ inputs.reps && format('--reps {0}', inputs.reps) || '' }} --seed ${{ inputs.seed }}
         timeout-minutes: 135
       - name: Finish
         if: always()
@@ -122,7 +126,7 @@ jobs:
   cpu2:
     if: inputs.group == 'cpu2'
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 200
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: pipx install uv==0.11.26 && uv python install 3.12 && uv sync
@@ -134,9 +138,9 @@ jobs:
         run: |
           s=$(date +%s.%N); docker pull $IMAGE >/dev/null; e=$(date +%s.%N)
           echo "pull_s=$(echo "$e - $s" | bc)" | tee ../cost/results/pull.txt
-      - name: Real suite pinned to 2 CPUs (emulation of a 2 vCPU runner)
-        run: uv run python ../cost/cost.py suite ../cost/results/cpu2.json --label cpu2 --pin 2 --cpus 2 --workers ${{ inputs.workers }} --reps ${{ inputs.reps }} --seed ${{ inputs.seed }}
-        timeout-minutes: 105
+      - name: Real suite on 4 vCPU and pinned to 2 CPUs (emulation of a 2 vCPU runner), same job
+        run: uv run python ../cost/cost.py suite ../cost/results/cpu2.json --label cpu2 --pins 0,2 --cpus 3 ${{ inputs.workers && format('--workers {0}', inputs.workers) || '' }} ${{ inputs.reps && format('--reps {0}', inputs.reps) || '' }} --seed ${{ inputs.seed }}
+        timeout-minutes: 180
       - name: Finish
         if: always()
         run: |
@@ -151,7 +155,7 @@ jobs:
   model:
     if: inputs.group == 'model'
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 260
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: pipx install uv==0.11.26 && uv python install 3.12 && uv sync
@@ -164,8 +168,8 @@ jobs:
           s=$(date +%s.%N); docker pull $IMAGE >/dev/null; e=$(date +%s.%N)
           echo "pull_s=$(echo "$e - $s" | bc)" | tee ../cost/results/pull.txt
       - name: Synthetic suite at several worker counts
-        run: uv run python ../cost/cost.py model ../cost/results/model.json --workers ${{ inputs.workers }} --reps ${{ inputs.reps }} --seed ${{ inputs.seed }} --s ${{ inputs.s }} --m ${{ inputs.m }} --fast-ms ${{ inputs.fast_ms }}
-        timeout-minutes: 135
+        run: uv run python ../cost/cost.py model ../cost/results/model.json ${{ inputs.workers && format('--workers {0}', inputs.workers) || '' }} ${{ inputs.reps && format('--reps {0}', inputs.reps) || '' }} --seed ${{ inputs.seed }} --s ${{ inputs.s }} --m ${{ inputs.m }} --fast-ms ${{ inputs.fast_ms }} --pins ${{ inputs.pins }}
+        timeout-minutes: 240
       - name: Finish
         if: always()
         run: |

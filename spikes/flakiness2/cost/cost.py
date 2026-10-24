@@ -17,6 +17,7 @@ import json
 import os
 import platform
 import random
+import re
 import shutil
 import statistics as st
 import subprocess
@@ -78,6 +79,8 @@ def engine_up(container, port, cpus, cpuset="", mem="10g") -> float:
     d = time.perf_counter() - t
     if r.returncode:
         raise RuntimeError("engine start failed: " + (r.stderr or r.stdout)[-400:])
+    m = re.search(r"first_ok=([0-9.]+)", r.stdout)
+    engine_up.first_ok = float(m.group(1)) if m else None
     return d
 
 
@@ -128,9 +131,9 @@ def cmd_image(a):
 # ---- running pytest against one container -------------------------------------------------------------------------
 
 
-def canary() -> float:
+def canary(pin=0) -> float:
     code = "import time\nt=time.perf_counter()\nx=0\nfor i in range(6000000): x+=i*i\nprint(time.perf_counter()-t)"
-    return round(float(sh([sys.executable, "-c", code]).stdout.strip() or 0), 3)
+    return round(float(sh(pin_cmd(pin) + [sys.executable, "-c", code]).stdout.strip() or 0), 3)
 
 
 def parse_junit(p):
@@ -147,7 +150,8 @@ def parse_junit(p):
                 o = "failed"
                 reason = (ch.get("message") or "")[:200]
             elif ch.tag == "skipped" and o == "passed":
-                o = "skipped"
+                o = "xfailed" if "xfail" in (ch.get("type") or "") else "skipped"
+                reason = (ch.get("message") or "")[:200]
         out.append({"id": f"{tc.get('classname')}::{tc.get('name')}", "s": float(tc.get("time") or 0), "o": o, "why": reason})
     return out
 
@@ -191,25 +195,29 @@ def finish(out, meta, rows, tests):
 def cmd_suite(a):
     workers = [int(x) for x in a.workers.split(",")]
     cpus = [int(x) for x in a.cpus.split(",")]
-    arms = [(c, w) for c in cpus for w in workers]
+    pins = [int(x) for x in a.pins.split(",")]
+    # an arm with pin P > 0 runs the whole job on P CPUs (engine limit P, cpuset, taskset); pin 0 uses the engine limits in --cpus
+    arms = [(p, c if not p else p, w) for p in pins for c in (cpus if not p else [0]) for w in workers]
     jobs = schedule(arms, a.reps, a.seed)
-    cpuset = ",".join(str(i) for i in range(a.pin)) if a.pin else ""
-    meta = {"group": a.label, "seed": a.seed, "reps": a.reps, "arms": arms, "order": [[c, w, r] for (c, w), r in jobs],
-            "pin": a.pin, "taskset": bool(a.pin and shutil.which("taskset")), "cpuset": cpuset,
-            "emulation": bool(a.pin), "stress_repeats": a.stress_repeats, "backends": a.backends, "k": a.k,
+    meta = {"group": a.label, "seed": a.seed, "reps": a.reps, "arms": arms, "order": [[p, c, w, r] for (p, c, w), r in jobs],
+            "pins": pins, "taskset": bool(any(pins) and shutil.which("taskset")),
+            "emulation": any(pins), "stress_repeats": a.stress_repeats, "backends": a.backends, "k": a.k,
             "machine": machine(), "started": time.time()}
     print("order:", meta["order"], flush=True)
     rows, tests = [], {}
     tmp = Path(a.out).resolve().parent / "tmp"
     tmp.mkdir(parents=True, exist_ok=True)
     tails = []
-    for idx, ((c, w), rep) in enumerate(jobs):
+    for idx, ((p, c, w), rep) in enumerate(jobs):
         rid = f"{idx:02d}"
         prefix = f"r{rid}"
-        row = {"id": rid, "cpus": c, "workers": w, "rep": rep, "order": idx, "error": ""}
+        cpuset = ",".join(str(i) for i in range(p)) if p else ""
+        a.pin = p
+        row = {"id": rid, "pin": p, "cpus": c, "workers": w, "rep": rep, "order": idx, "error": ""}
         try:
-            row["canary_s"] = canary()
+            row["canary_s"] = canary(p)
             row["start_s"] = round(engine_up(a.container, a.port, c, cpuset, a.mem), 2)
+            row["first_ok_s"] = engine_up.first_ok
             extra = ["tests/test_parity.py", "tests/test_stress.py", f"--stress-repeats={a.stress_repeats}", f"--backends={a.backends}"]
             if a.k:
                 extra += ["-k", a.k]
@@ -219,6 +227,7 @@ def cmd_suite(a):
             ts = parse_junit(junit)
             row.update(pytest_s=round(d, 2), rc=r.returncode, n=len(ts), passed=sum(t["o"] == "passed" for t in ts),
                        failed=sum(t["o"] == "failed" for t in ts), skipped=sum(t["o"] == "skipped" for t in ts),
+                       xfailed=sum(t["o"] == "xfailed" for t in ts),
                        sum_test_s=round(sum(t["s"] for t in ts), 2), summary=(r.stdout.strip().splitlines() or [""])[-1])
             tests[rid] = [[t["id"], t["s"], t["o"], t["why"]] for t in ts]
             if r.returncode and not ts:
@@ -241,21 +250,24 @@ def cmd_suite(a):
 
 def cmd_model(a):
     workers = [int(x) for x in a.workers.split(",")]
-    jobs = schedule([(a.cpus, w) for w in workers], a.reps, a.seed)
-    cpuset = ",".join(str(i) for i in range(a.pin)) if a.pin else ""
-    meta = {"group": "model", "seed": a.seed, "reps": a.reps, "order": [[w, r] for (_, w), r in jobs], "S": a.s, "M": a.m,
-            "fast_ms": a.fast_ms, "cpus": a.cpus, "pin": a.pin, "machine": machine(), "started": time.time()}
+    pins = [int(x) for x in a.pins.split(",")]
+    jobs = schedule([(p, p or a.cpus, w) for p in pins for w in workers], a.reps, a.seed)
+    meta = {"group": "model", "seed": a.seed, "reps": a.reps, "order": [[p, w, r] for (p, _, w), r in jobs], "S": a.s, "M": a.m,
+            "fast_ms": a.fast_ms, "cpus": a.cpus, "pins": pins, "machine": machine(), "started": time.time()}
     print("order:", meta["order"], flush=True)
     rows = []
     tmp = Path(a.out).resolve().parent / "tmp"
-    for idx, ((c, w), rep) in enumerate(jobs):
+    for idx, ((p, c, w), rep) in enumerate(jobs):
         rid = f"{idx:02d}"
-        row = {"id": rid, "cpus": c, "workers": w, "rep": rep, "order": idx, "error": ""}
+        cpuset = ",".join(str(i) for i in range(p)) if p else ""
+        a.pin = p
+        row = {"id": rid, "pin": p, "cpus": c, "workers": w, "rep": rep, "order": idx, "error": ""}
         od = tmp / rid
         od.mkdir(parents=True, exist_ok=True)
         try:
-            row["canary_s"] = canary()
+            row["canary_s"] = canary(p)
             row["start_s"] = round(engine_up(a.container, a.port, c, cpuset, a.mem), 2)
+            row["first_ok_s"] = engine_up.first_ok
             junit = str(od / "j.xml")
             d, r = run_pytest(a, w, f"r{rid}", ["-x"] if False else [], {
                 "MODEL_S": str(a.s), "MODEL_M": str(a.m), "MODEL_FAST_MS": str(a.fast_ms), "MODEL_OUT": str(od),
@@ -324,21 +336,20 @@ def an_suite(d, name):
     m, rows = j["meta"], j["runs"]
     o = [f"### {name}: real suite, one shared container", ""]
     if m.get("emulation"):
-        o.append(f"EMULATION of a {m['pin']}-vCPU runner on a 4-vCPU hosted runner (container --cpus and --cpuset-cpus, test process under taskset: {m['taskset']}). Memory is not emulated.\n")
+        o.append(f"Rows with pin P are an EMULATION of a P-vCPU runner on the 4-vCPU hosted runner (container --cpus and --cpuset-cpus, test and canary processes under taskset: {m['taskset']}). Memory is not emulated. All arms of this job ran on one runner (one CPU model)." + "\n")
     o.append(f"CPU: {m['machine']['cpu']}; nproc {m['machine']['nproc']}; seed {m['seed']}; reps {m['reps']}; stress repeats {m['stress_repeats']}; backends {m['backends']}; image {m['machine']['image_id'][:80]}\n")
-    heads = ["engine cpus", "xdist workers", "runs", "engine start s", "pytest s (median)", "pytest s (range)", "total s (median)",
-             "tests", "failed (max)", "sum of test s (median)", "canary s (median)"]
+    heads = ["pin", "engine cpus", "xdist workers", "runs", "engine start s", "first answer s", "pytest s (median)", "pytest s (range)", "total s (median)",
+             "tests", "failed (max)", "xfailed", "skipped", "sum of test s (median)", "canary s (median)"]
     t = []
-    for c in sorted({r["cpus"] for r in rows}):
+    for pn, c in sorted({(r.get("pin", 0), r["cpus"]) for r in rows}):
         for w in sorted({r["workers"] for r in rows}):
-            g = [r for r in rows if r["cpus"] == c and r["workers"] == w and not r["error"]]
+            g = [r for r in rows if r.get("pin", 0) == pn and r["cpus"] == c and r["workers"] == w and not r["error"]]
             if not g:
                 continue
-            base = [r for r in rows if r["cpus"] == c and r["workers"] == 0 and not r["error"]]
-            t.append(["unlimited" if c == 0 else c, "none (-p no:xdist)" if w == 0 else w, f"{len(g)}", f"{med([r['start_s'] for r in g]):.1f}",
+            t.append(["none (4 vCPU)" if not pn else f"{pn} CPUs (emulation)", "unlimited" if c == 0 else c, "none (-p no:xdist)" if w == 0 else w, f"{len(g)}", f"{med([r['start_s'] for r in g]):.1f}", f"{med([r.get('first_ok_s') for r in g]):.1f}",
                       f"{med([r['pytest_s'] for r in g]):.1f}", rng([r["pytest_s"] for r in g]),
                       f"{med([r['start_s'] + r['pytest_s'] for r in g]):.1f}", g[0]["n"], max(r["failed"] for r in g),
-                      f"{med([r['sum_test_s'] for r in g]):.1f}", f"{med([r['canary_s'] for r in g]):.2f}"])
+                      max(r.get("xfailed", 0) for r in g), max(r["skipped"] for r in g), f"{med([r['sum_test_s'] for r in g]):.1f}", f"{med([r['canary_s'] for r in g]):.2f}"])
     o.append(table(heads, t))
     bad = [r for r in rows if r["error"]]
     if bad:
@@ -352,18 +363,26 @@ def an_suite(d, name):
             r = next(x for x in rows if x["id"] == rid)
             for tid, s, oc, why in ts:
                 if oc == "failed":
-                    fails.setdefault(tid, []).append(f"{r['workers']}w/{r['cpus']}c")
+                    fails.setdefault(tid, []).append(f"{r['workers']}w/{r['cpus']}c/pin{r.get('pin', 0)}")
         if fails:
             o.append("Failed tests (id, arms where it failed):\n")
             o.append(table(["test", "count", "arms"], [[k, len(v), ", ".join(sorted(set(v)))[:120]] for k, v in sorted(fails.items(), key=lambda x: -len(x[1]))[:25]]))
         slow = {}
         for rid, ts in tests.items():
             r = next(x for x in rows if x["id"] == rid)
-            if r["workers"] == 0:
+            if r["workers"] == 0 and r.get("pin", 0) == 0:
                 for tid, s, oc, why in ts:
                     slow.setdefault(tid, []).append(s)
+        nf = {}
+        for rid, ts in tests.items():
+            for tid, s_, oc, why in ts:
+                if oc in ("skipped", "xfailed"):
+                    nf[(tid, oc, why)] = nf.get((tid, oc, why), 0) + 1
+        if nf:
+            o.append("Skipped and expected-failure tests (reason from the report):" + "\n")
+            o.append(table(["test", "kind", "reason", "runs"], [[k[0], k[1], k[2][:90], v] for k, v in sorted(nf.items())]))
         if slow:
-            o.append("Slowest tests with no xdist (median over runs):\n")
+            o.append("Slowest tests with no xdist, no pin (median over runs):\n")
             o.append(table(["test", "median s"], [[k, f"{med(v):.2f}"] for k, v in sorted(slow.items(), key=lambda x: -med(x[1]))[:10]]))
     return "\n".join(o)
 
@@ -373,48 +392,50 @@ def an_model(d):
     m, rows = j["meta"], j["runs"]
     S, M = m["S"], m["M"]
     o = ["### model: synthetic suite", "",
-         f"S = {S} engine tests (one write-and-wait each), M = {M} engine-free tests (mongomock plus {m['fast_ms']} ms CPU each); engine limit {m['cpus']} CPUs; seed {m['seed']}; reps {m['reps']}; CPU: {m['machine']['cpu']}\n"]
-    ws = sorted({r["workers"] for r in rows})
-    g = {w: [r for r in rows if r["workers"] == w and not r["error"]] for w in ws}
-    s_ = med([r["settle_test_mean_s"] for r in g.get(0, [])])
-    t_ = med([r["fast_mean_s"] for r in g.get(0, [])])
-    K = S * s_ + M * t_ if g.get(0) else float("nan")
-    t = []
-    for w in ws:
-        if not g[w]:
-            continue
-        T = med([r["pytest_s"] for r in g[w]])
-        t.append(["none" if w == 0 else w, len(g[w]), f"{T:.1f}", rng([r["pytest_s"] for r in g[w]]), f"{med([r['start_s'] for r in g[w]]):.1f}",
-                  f"{med([r['lag_p50'] for r in g[w]]):.3f}", f"{max(r['lag_max'] for r in g[w]):.2f}", max(r["failed"] for r in g[w])])
-    o.append(table(["xdist workers", "runs", "pytest s (median)", "range", "engine start s", "settle p50 s", "settle max s", "failed"], t))
-    if g.get(0):
-        o.append(f"Measured at no xdist: settle test mean {s_:.3f} s, fast test mean {t_*1000:.1f} ms; work K = S*s + M*t = {K:.0f} s.\n")
-        pts = [(w, med([r["pytest_s"] for r in g[w]])) for w in ws if w >= 1 and g[w]]
-        t0 = [r["pytest_s"] for r in g[0]]
-        a0 = med(t0) - K
-        o.append(f"Fixed part at no xdist (pytest s minus K, includes per-worker index setup and collection): {a0:.1f} s.\n")
-        rows2 = []
-        for w, T in pts:
-            pred = a0 + K / w
-            rows2.append([w, f"{T:.1f}", f"{pred:.1f}", f"{T - pred:+.1f}"])
-        o.append("Model T(W) = a + K/W with a from the no-xdist run, against measured:\n")
-        o.append(table(["W", "measured s", "model s", "residual s"], rows2))
-        f2 = fit(pts, K) if len(pts) >= 2 else None
-        if f2:
-            a, c = f2
-            o.append(f"Least squares T = a + c*W + K/W over W>=1: a = {a:.1f} s, c = {c:.2f} s per worker" + (f", optimum W = sqrt(K/c) = {(K / c) ** 0.5:.1f}" if c > 0 else ", c <= 0: no per-worker cost found in this range") + ".\n")
-        mt = []
-        prev = None
-        for w, T in [(0, med([r["pytest_s"] for r in g[0]]))] + pts:
-            if prev is not None:
-                mt.append([f"{prev[0]} to {w}", f"{prev[1] - T:.1f}", f"{100 * (prev[1] - T) / prev[1]:.0f}%"])
-            prev = (w, T)
-        o.append("Saving of each step (a step saving under 10% is where adding workers stops paying):\n")
-        o.append(table(["step", "saved s", "saved %"], mt))
-        o.append("Total wall including engine start: " + ", ".join(f"{'none' if w == 0 else w}: {med([r['start_s'] + r['pytest_s'] for r in g[w]]):.0f} s" for w in ws if g[w]) + ".\n")
+         f"S = {S} engine tests (one write-and-wait each), M = {M} engine-free tests (mongomock plus {m['fast_ms']} ms CPU each); engine limit {m['cpus']} CPUs on the unpinned arm; seed {m['seed']}; reps {m['reps']}; CPU: {m['machine']['cpu']} (one runner for all arms)" + "\n"]
+    for pn in sorted({r.get("pin", 0) for r in rows}):
+        rp = [r for r in rows if r.get("pin", 0) == pn]
+        o.append(f"#### {'4 vCPU runner, engine limit ' + str(m['cpus']) + ' CPUs' if not pn else str(pn) + ' CPUs (EMULATION: container --cpus/--cpuset, taskset)'}" + "\n")
+        ws = sorted({r["workers"] for r in rp})
+        g = {w: [r for r in rp if r["workers"] == w and not r["error"]] for w in ws}
+        s_ = med([r["settle_test_mean_s"] for r in g.get(0, [])])
+        t_ = med([r["fast_mean_s"] for r in g.get(0, [])])
+        K = S * s_ + M * t_ if g.get(0) else float("nan")
+        t = []
+        for w in ws:
+            if not g[w]:
+                continue
+            T = med([r["pytest_s"] for r in g[w]])
+            t.append(["none" if w == 0 else w, len(g[w]), f"{T:.1f}", rng([r["pytest_s"] for r in g[w]]), f"{med([r['start_s'] for r in g[w]]):.1f}",
+                      f"{med([r['lag_p50'] for r in g[w]]):.3f}", f"{max(r['lag_max'] for r in g[w]):.2f}", max(r["failed"] for r in g[w])])
+        o.append(table(["xdist workers", "runs", "pytest s (median)", "range", "engine start s", "settle p50 s", "settle max s", "failed"], t))
+        if g.get(0):
+            o.append(f"Measured at no xdist: settle test mean {s_:.3f} s, fast test mean {t_*1000:.1f} ms; work K = S*s + M*t = {K:.0f} s." + "\n")
+            pts = [(w, med([r["pytest_s"] for r in g[w]])) for w in ws if w >= 1 and g[w]]
+            a0 = med([r["pytest_s"] for r in g[0]]) - K
+            o.append(f"Fixed part at no xdist (pytest s minus K): {a0:.1f} s." + "\n")
+            o.append("Model T(W) = a + K/W with a from the no-xdist run, against measured:" + "\n")
+            o.append(table(["W", "measured s", "model s", "residual s"], [[w, f"{T:.1f}", f"{a0 + K / w:.1f}", f"{T - (a0 + K / w):+.1f}"] for w, T in pts]))
+            f2 = fit(pts, K) if len(pts) >= 3 else None
+            if f2:
+                a, c = f2
+                lo, hi = min(w for w, _ in pts), max(w for w, _ in pts)
+                if c > 0 and lo <= (K / c) ** 0.5 <= hi:
+                    o.append(f"Least squares T = a + c*W + K/W over the tested W {lo} to {hi}: a = {a:.1f} s, c = {c:.2f} s per worker, optimum W = {(K / c) ** 0.5:.1f} (inside the tested range)." + "\n")
+                else:
+                    o.append(f"Least squares T = a + c*W + K/W over the tested W {lo} to {hi}: a = {a:.1f} s, c = {c:.2f} s per worker; the optimum is outside the tested range, so no optimum is reported." + "\n")
+            mt = []
+            prev = None
+            for w, T in [(0, med([r["pytest_s"] for r in g[0]]))] + pts:
+                if prev is not None:
+                    mt.append([f"{prev[0]} to {w}", f"{prev[1] - T:.1f}", f"{100 * (prev[1] - T) / prev[1]:.0f}%"])
+                prev = (w, T)
+            o.append("Saving of each step (under 10% is where adding workers stops paying; a negative saving means slower):" + "\n")
+            o.append(table(["step", "saved s", "saved %"], mt))
+            o.append("Total wall including engine start: " + ", ".join(f"{'none' if w == 0 else w}: {med([r['start_s'] + r['pytest_s'] for r in g[w]]):.0f} s" for w in ws if g[w]) + "." + "\n")
     bad = [r for r in rows if r["error"] or r["failed"]]
     if bad:
-        o.append("Errored or failing runs: " + "; ".join(f"{r['id']} w={r['workers']} failed={r['failed']} {r['error'][:100]}" for r in bad) + "\n")
+        o.append("Errored or failing runs: " + "; ".join(f"{r['id']} pin={r.get('pin', 0)} w={r['workers']} failed={r['failed']} {r['error'][:100]}" for r in bad) + "\n")
     return "\n".join(o)
 
 
@@ -440,7 +461,8 @@ def an_image(d):
             ["docker save s (miss only)", g("save")], ["cache save step s (miss only)", ms("save_cache_start", "save_cache_end")]]
     li = by.get("image_local")
     m = info["machine"]
-    o = ["### image: cache restore against pull", "", f"CPU: {m['cpu']}; runner {m['runner_image']}; image {m['image_id'][:90]}\n", table(["item", "value"], rows)]
+    img = (li[-1]["inspect"] if li else m["image_id"])[:110]
+    o = ["### image: cache restore against pull", "", f"CPU: {m['cpu']}; runner {m['runner_image']}; image (id, size, digest after pull) {img}" + "\n", table(["item", "value"], rows)]
     o.append("Restore-path total to engine ready = restore step + load path total. Compare with the pull path total in the same job.\n")
     return "\n".join(o)
 
@@ -479,10 +501,10 @@ def main():
     for n in ("suite", "model"):
         q = s.add_parser(n)
         q.add_argument("out")
-        q.add_argument("--workers", default="0,1,2,4,8" if n == "suite" else "0,2,4,8")
+        q.add_argument("--workers", default="0,1,2,4,8" if n == "suite" else "0,2,4,8,12,16")
+        q.add_argument("--pins", default="0", help="comma list; P>0 runs that arm on P CPUs (emulation), 0 = the whole runner")
         q.add_argument("--reps", type=int, default=3 if n == "suite" else 2)
         q.add_argument("--seed", type=int, default=1)
-        q.add_argument("--pin", type=int, default=0, help="emulate this many CPUs (cpuset, taskset)")
         q.add_argument("--container", default="hoodie-fl2-cost")
         q.add_argument("--port", type=int, default=29501)
         q.add_argument("--mem", default="10g")

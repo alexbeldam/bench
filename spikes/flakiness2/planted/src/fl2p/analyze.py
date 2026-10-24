@@ -20,6 +20,7 @@ from .exp import wilson
 
 NS = (1, 5, 10, 20, 50, 100, 300)
 KS = (10, 20, 50, 100, 300)
+NL = chr(10)
 
 
 # ---- loading -----------------------------------------------------------------------------------------------------------
@@ -32,15 +33,17 @@ def load_dir(d: str) -> dict[str, Any]:
             obj = json.load(gzip.open(p, "rt", encoding="utf8"))
         elif p.suffix == ".json":
             obj = json.loads(p.read_text(encoding="utf8"))
-        elif p.name.endswith(".jsonl") and "canary" in p.name:
-            rows = [json.loads(x) for x in p.read_text(encoding="utf8").splitlines() if x.strip()]
-            out["canary"].append({"name": p.name, "rows": rows})
+        elif (p.name.endswith(".jsonl") or p.name.endswith(".jsonl.gz")) and "canary" in p.name:
+            txt = gzip.open(p, "rt", encoding="utf8").read() if p.name.endswith(".gz") else p.read_text(encoding="utf8")
+            rows = [json.loads(x) for x in txt.splitlines() if x.strip()]
+            out["canary"].append({"name": p.name, "rows": rows, "dir": p.parent.name})
             continue
         else:
             continue
         if not isinstance(obj, dict) or "kind" not in obj:
             continue
         obj["_name"] = p.name
+        obj["_dir"] = p.parent.name
         out[obj["kind"]].append(obj)
     return out
 
@@ -130,10 +133,13 @@ class Book:
         self.cost: dict[str, dict[int, dict[str, Any]]] = defaultdict(dict)
         self.order: list[str] = []
         self.note: dict[str, str] = {}
+        self.src: dict[str, set[str]] = defaultdict(set)  # CPU models of the files behind each strategy row
+        self.cur = "?"
 
     def add(self, strat: str, run: int, test: str, fl: list[bool]) -> None:
         if strat not in self.order:
             self.order.append(strat)
+        self.src[strat].add(self.cur)
         self.flags[strat][run].setdefault(test, [])
         self.flags[strat][run][test] = list(self.flags[strat][run][test]) + list(fl)
 
@@ -155,6 +161,10 @@ def mean_wall(exps: list[dict[str, Any]]) -> float:
     return statistics.fmean(e["wall_s"] for e in exps) if exps else float("nan")
 
 
+def cpu_of(o: dict[str, Any]) -> str:
+    return (o.get("machine", {}).get("cpu") or "?").strip()
+
+
 def overhead(m: dict[str, Any]) -> float:
     try:
         return float(m.get("fl2p_setup_s", 0.0))
@@ -162,9 +172,9 @@ def overhead(m: dict[str, Any]) -> float:
         return 0.0
 
 
-def build(runs: list[dict[str, Any]]) -> tuple[Book, dict[str, Any]]:
+def build(runs: list[dict[str, Any]], run_dirs_ref: list[str]) -> tuple[Book, dict[str, Any]]:
     b = Book()
-    info: dict[str, Any] = {"labels": {}, "machines": [], "pool_rate": {}, "pool_n": {}}
+    info: dict[str, Any] = {"labels": {}, "machines": [], "pool_rate": {}, "pool_n": {}, "files": []}
     for r, data in enumerate(runs):
         ms = [o["machine"] for k in data if k != "canary" for o in data[k] if isinstance(o, dict) and "machine" in o]
         info["machines"].append(ms[0] if ms else {})
@@ -176,6 +186,8 @@ def build(runs: list[dict[str, Any]]) -> tuple[Book, dict[str, Any]]:
         pass_wall = None
         # suites
         for o in data["suite"]:
+            b.cur, oh = cpu_of(o), overhead(o["machine"])
+            info["files"].append((run_dirs_ref[r], o["_dir"], o["_name"], cpu_of(o), o["machine"].get("runner_image", ""), o["machine"].get("fl2p_setup_s", "")))
             nm, st, ps, ar = o["_name"], o["strategy"], o["passes"], o["arm"]
             ex = o["exps"]
             if nm.startswith("noise-"):
@@ -188,7 +200,7 @@ def build(runs: list[dict[str, Any]]) -> tuple[Book, dict[str, Any]]:
                 strat = "S0 single run, default order"
                 pass_wall = mean_wall(ex)
             elif ar == "jitter":
-                strat = f"S5 random order x{ps} + loop jitter"
+                strat = f"S5 random order x{ps} + GIL jitter"
             elif ps == 1:
                 strat = "S1 single run, random order"
             else:
@@ -207,6 +219,8 @@ def build(runs: list[dict[str, Any]]) -> tuple[Book, dict[str, Any]]:
                 b.set_cost(s2, r, wall=mean_wall(ex), modeled=False, runners=1, overhead=oh)
         # forced
         for o in data["forced"]:
+            b.cur, oh = cpu_of(o), overhead(o["machine"])
+            info["files"].append((run_dirs_ref[r], o["_dir"], o["_name"], cpu_of(o), o["machine"].get("runner_image", ""), o["machine"].get("fl2p_setup_s", "")))
             ex = o["exps"]
             forced = [t for t, lb in o["labels"].items() if lb["forced"]]
             for t in forced:
@@ -214,6 +228,8 @@ def build(runs: list[dict[str, Any]]) -> tuple[Book, dict[str, Any]]:
             b.set_cost("S3 deterministic fault injection (forced)", r, wall=mean_wall(ex), modeled=False, runners=1, overhead=oh)
         # repeats (order scope)
         for o in data["repeat"]:
+            b.cur, oh = cpu_of(o), overhead(o["machine"])
+            info["files"].append((run_dirs_ref[r], o["_dir"], o["_name"], cpu_of(o), o["machine"].get("runner_image", ""), o["machine"].get("fl2p_setup_s", "")))
             ex = o["exps"]
             for n in NS:
                 strat = f"S2{'f' if o['scope'] == 'function' else 's'} repeat-job N={n} ({o['scope']} scope, shared state)"
@@ -222,6 +238,8 @@ def build(runs: list[dict[str, Any]]) -> tuple[Book, dict[str, Any]]:
                 b.set_cost(strat, r, wall=mean_wall(ex) * n / o["nmax"], modeled=True, runners=1, overhead=oh, subset=True)
         # prop
         for o in data["prop"]:
+            b.cur, oh = cpu_of(o), overhead(o["machine"])
+            info["files"].append((run_dirs_ref[r], o["_dir"], o["_name"], cpu_of(o), o["machine"].get("runner_image", ""), o["machine"].get("fl2p_setup_s", "")))
             race = {"purge": "purge-probe", "reset": "reset-order", "tie": "tie-order"}
             for bug, t in race.items():
                 rows = [x for x in o["rows"] if x["bug"] == bug]
@@ -233,6 +251,8 @@ def build(runs: list[dict[str, Any]]) -> tuple[Book, dict[str, Any]]:
             info.setdefault("prop_rows", []).extend(rows)
         # pools
         for o in data["pool"]:
+            b.cur, oh = cpu_of(o), overhead(o["machine"])
+            info["files"].append((run_dirs_ref[r], o["_dir"], o["_name"], cpu_of(o), o["machine"].get("runner_image", ""), o["machine"].get("fl2p_setup_s", "")))
             noise = o["_name"].startswith("noise-")
             arm = o["arm"]
             for t, d in o["tests"].items():
@@ -241,7 +261,7 @@ def build(runs: list[dict[str, Any]]) -> tuple[Book, dict[str, Any]]:
                     info["pool_rate"][t][0] += d["fail"].count("1")
                     info["pool_rate"][t][1] += d["n"]
             tests = o["tests"]
-            pw = pass_wall
+            pw = None  # modeled from this pool's own per-test mean durations (same machine), not from another job
             if noise:
                 for n in (5,):
                     strat = f"S4 noise {arm} N={n}"
@@ -345,14 +365,15 @@ def group_fp(b: Book, strat: str, tests: list[str]) -> tuple[int, int, int]:
 def cost_row(b: Book, strat: str) -> str:
     cs = list(b.cost.get(strat, {}).values())
     if not cs:
-        return "| n/a | n/a | n/a | n/a |"
-    wall = statistics.fmean(c["wall"] for c in cs if c["wall"] == c["wall"]) if any(c["wall"] == c["wall"] for c in cs) else float("nan")
+        return "| n/a | n/a | n/a | n/a | n/a |"
+    ok = [c for c in cs if c["wall"] == c["wall"]]
+    wall = statistics.fmean(c["wall"] for c in ok) if ok else float("nan")
     oh = statistics.fmean(c["overhead"] for c in cs)
     runners = cs[0]["runners"]
     billed = runners * math.ceil((oh + wall) / 60) if runners and wall == wall else 0
     tag = "modeled" if cs[0]["modeled"] else "measured"
     sub = ", subset of the suite" if cs[0].get("subset") else ""
-    return f"| {wall:.2f} ({tag}{sub}) | {billed} | {runners} | {oh:.0f} |"
+    return f"| {wall:.2f} ({tag}{sub}) | {oh + wall:.1f} | {billed} | {runners} | {oh:.0f} |"
 
 
 def planted_cols(info: dict[str, Any]) -> tuple[list[str], list[str], list[str]]:
@@ -369,30 +390,41 @@ def md_table(head: list[str], rows: list[list[str]]) -> str:
     return "\n".join(out)
 
 
+def pct(xs: list[float], q: float) -> float:
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(q * len(xs)))]
+
+
 def real_tables(runs: list[dict[str, Any]]) -> str:
-    """Real-engine pools: truth from the first half of each test's sequence, detection experiments from the second half."""
+    """Real-engine pools: truth from the first half of each test's run sequence, detection experiments from the second half.
+    Arms of one shard ran in the same job, so base, ref (no noise, same n as the arms), engine1 and stress100 compare on one CPU."""
     seqs: dict[tuple[str, str], list[str]] = defaultdict(list)
     durs: dict[tuple[str, str], list[float]] = defaultdict(list)
-    errs: dict[str, dict[str, int]] = defaultdict(dict)
+    errs: dict[tuple[str, str], dict[str, int]] = defaultdict(dict)
+    vals: dict[tuple[str, str], dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    cpu: dict[str, set[str]] = defaultdict(set)
     meta = []
     for data in runs:
         for o in data["real-pool"]:
-            meta.append((o["arm"], o["shard"], o["machine"], o["wall_s"], o["workers"]))
+            meta.append((o["arm"], o["shard"], o["machine"], o["wall_s"], o["workers"], o.get("arm_order")))
             for t, d in o["tests"].items():
                 seqs[(t, o["arm"])].append(d["fail"])
                 durs[(t, o["arm"])].append(d["dur_mean"])
+                cpu[t].add(cpu_of(o))
                 for k, v in d["errs"].items():
-                    errs[t][k] = errs[t].get(k, 0) + v
+                    errs[(t, o["arm"])][k] = errs[(t, o["arm"])].get(k, 0) + v
+                for k, v in d.get("vals", {}).items():
+                    vals[(t, o["arm"])][k] += [x for x in v if x is not None]
     if not seqs:
-        return "No real-engine files in the run directories.\n"
-    out = ["## Real engine\n"]
-    out.append(md_table(["arm", "shard", "CPU", "image", "engine digest", "workers", "wall s"],
-                        [[a, s, m.get("cpu", ""), m.get("runner_image", ""), (m.get("fl2p_engine_digest", "") or "")[:80], str(w), f"{wl:.0f}"] for a, s, m, wl, w in meta]))
-    out.append("\n### Ground truth and detection (arm base)\n")
-    out.append("Truth = first half of each test's run sequence (time order, pooled over occasions only inside each half). Detection = non-overlapping blocks of N consecutive runs of the second half. Analytic = 1-(1-p)^N with p the truth-half rate. K is the number of blocks. Wall is modeled: N x mean run time, one test on one runner, billed minutes = ceil((set-up + engine start + wall) / 60) with the set-up of the first shard job (0 when not recorded), modeled and not billed. Runs inside a shard share the container and four worker processes, so the mean run time is the time under that load.\n")
-    head = ["test", "truth n", "truth rate [Wilson]", "second-half rate"] + [f"N={n} measured (K) / analytic" for n in (1, 5, 10, 20, 50)] + ["mean run s", "N=20 wall s (billed min)", "N=50 wall s (billed min)", "errors seen"]
+        return "No real-engine files in the run directories." + NL
+    out = ["## Real engine" + NL]
+    out.append(md_table(["arm", "shard", "CPU", "image", "engine digest", "workers", "wall s", "arm order (shuffled, seeded)"],
+                        [[a, s, cpu_of({"machine": m}), m.get("runner_image", ""), (m.get("fl2p_engine_digest", "") or "")[:80], str(w), f"{wl:.0f}", str(ao or "")] for a, s, m, wl, w, ao in meta]))
+    out.append(NL + "### Ground truth and detection (arm base)" + NL)
+    out.append("Truth = first half of each test's run sequence (time order). Detection = non-overlapping blocks of N consecutive runs of the second half. Analytic = 1-(1-p)^N with p the truth-half rate. K is the number of blocks. Wall is modeled: N x mean run time of one test; billed minutes = ceil((set-up + engine start + wall) / 60) with the set-up of the first shard job (0 when not recorded), modeled and not billed. The wall column is work only; set-up and engine start are in the minutes. Runs inside a shard share the container and four worker processes, so the mean run time is the time under that load. Errors are those of the base arm only. CPU is the CPU of the job that ran the test: do not compare rates of tests from different CPUs." + NL)
+    head = ["test", "CPU", "truth n", "truth rate [Wilson]", "second-half rate"] + [f"N={n} measured (K) / analytic" for n in (1, 5, 10, 20, 50)] + ["mean run s", "N=20 wall s (billed min)", "N=50 wall s (billed min)", "errors seen (base)"]
     oh = 0.0
-    for a_, s_, m_, w_, k_ in meta:
+    for a_, s_, m_, w_, k_, ao_ in meta:
         try:
             oh = float(m_.get("fl2p_setup_s", 0)) + float(m_.get("fl2p_engine_start_s", 0))
         except ValueError:
@@ -418,17 +450,19 @@ def real_tables(runs: list[dict[str, Any]]) -> str:
         p = tr_x / tr_n if tr_n else 0.0
         lo, hi = wilson(tr_x, tr_n)
         dm = statistics.fmean(durs[(t, a)])
-        row = [t, str(tr_n), f"{100 * p:.1f}% [{100 * lo:.1f}-{100 * hi:.1f}]", f"{h2_x}/{h2_n}"]
+        row = [t, "; ".join(sorted(cpu[t])), str(tr_n), f"{100 * p:.1f}% [{100 * lo:.1f}-{100 * hi:.1f}]", f"{h2_x}/{h2_n}"]
         for n, (x, k) in cells.items():
             row.append(f"{short(x, k)} / {100 * (1 - (1 - p) ** n):.0f}%" if k else "n/a")
-        row += [f"{dm:.2f}", f"{20 * dm:.0f} ({math.ceil((oh + 20 * dm) / 60)})", f"{50 * dm:.0f} ({math.ceil((oh + 50 * dm) / 60)})", "; ".join(f"{k}: {v}" for k, v in list(errs[t].items())[:2])]
+        row += [f"{dm:.2f}", f"{20 * dm:.0f} ({math.ceil((oh + 20 * dm) / 60)})", f"{50 * dm:.0f} ({math.ceil((oh + 50 * dm) / 60)})",
+                "; ".join(f"{k}: {v}" for k, v in list(errs[(t, "base")].items())[:2])]
         rows.append(row)
     out.append(md_table(head, rows))
-    out.append("\n### Environment arms on the real engine (rate over the whole sequence, Wilson 95%)\n")
+    out.append(NL + "### Environment arms on the real engine (rate over the whole sequence, Wilson 95%)" + NL)
+    out.append("Arms of one shard ran in the same job on the same CPU, in a shuffled order. `ref` repeats the arm tests with no noise and the same n as engine1 and stress100: compare the arms with `ref` (and with `base` of the same shard), not across shards." + NL)
     arms = sorted({a for (_, a) in seqs})
     rows = []
     for t in sorted({t for (t, _) in seqs}):
-        row = [t]
+        row = [t, "; ".join(sorted(cpu[t]))]
         for a in arms:
             ss = seqs.get((t, a))
             if not ss:
@@ -438,24 +472,49 @@ def real_tables(runs: list[dict[str, Any]]) -> str:
             n = sum(len(s) for s in ss)
             row.append(fmt(x, n))
         rows.append(row)
-    out.append(md_table(["test"] + arms, rows))
-    return "\n".join(out) + "\n"
+    out.append(md_table(["test", "CPU"] + arms, rows))
+    vrows = []
+    for (t, a), v in sorted(vals.items()):
+        if "window" not in v:
+            continue
+        bound = float(t.split("-b")[1]) if "-b" in t else float("nan")
+
+        def q(k, f):
+            return f"{f(v[k]):.3f}" if v.get(k) else "-"
+
+        vrows.append([t, a, str(len(v["window"])), f"{bound:.2f}", f"{q('pre', statistics.median)} / {q('pre', max)}",
+                      f"{q('window', min)} / {q('window', statistics.median)} / {q('window', max)}",
+                      f"{q('seen', min)} / {q('seen', statistics.median)} / {p99s(v["seen"], 0.99) if v.get('seen') else '-'} / {q('seen', max)}"])
+    if vrows:
+        out.append(NL + "### The settle path timed by the harness itself (seconds, from the engine sync call that follows the data commit)" + NL)
+        out.append("`pre`: first probe after the sync call (median / max). `window`: start of the last probe (min / median / max): the real time the settle allowed, against the nominal bound. `seen`: probe that saw the document (min / median / p99 / max), the harness's own write-to-searchable time. The bound counts the sleeps between probes, not the wall time and not the time from the commit, so the effective window exceeds the nominal bound by the probe times and the work before the first probe." + NL)
+        out.append(md_table(["test", "arm", "runs", "bound s", "pre", "window min / median / max", "seen min / median / p99 / max"], vrows))
+    return NL.join(out) + NL
+
+
+def p99s(xs: list[float], q: float) -> str:
+    return f"{pct(xs, q):.3f}"
 
 
 def analyze(run_dirs: list[str], out_dir: str) -> None:
     runs = [load_dir(d) for d in run_dirs]
-    b, info = build(runs)
+    b, info = build(runs, run_dirs)
     planted, controls, fixed = planted_cols(info)
     lab = info["labels"]
     b.order.sort(key=nat)
     md: list[str] = ["# Planted-flake strategy benchmark: tables\n"]
     md.append(f"Run directories (one occasion each): {len(run_dirs)}. {', '.join(run_dirs)}\n")
-    md.append("## Hardware of each run\n")
-    mrows = []
-    for d, m in zip(run_dirs, info["machines"]):
-        mrows.append([d, m.get("cpu", "?"), str(m.get("nproc", "?")), m.get("runner_image", "") or "local", m.get("python", ""), (m.get("sha", "") or "")[:8], str(m.get("fl2p_setup_s", "not recorded"))])
-    md.append(md_table(["dir", "CPU", "nproc", "runner image", "python", "commit", "set-up s"], mrows))
-    md.append("\nCPU and image are those of the first job file found in the directory. Jobs of one occasion can land on different CPUs; compare strategies within one run only.\n")
+    md.append("## Hardware of each job file\n")
+    hw = {}
+    for d, jd, nm, cpu, img, st in info["files"]:
+        hw[(d, jd, cpu, img, st)] = hw.get((d, jd, cpu, img, st), 0) + 1
+    mrows = [[d, jd, cpu, img or "local", str(st or "not recorded"), str(n)] for (d, jd, cpu, img, st), n in sorted(hw.items())]
+    md.append(md_table(["run dir", "job folder", "CPU", "runner image", "set-up s", "files"], mrows))
+    cpus = sorted({c for v in b.src.values() for c in v})
+    if len(cpus) > 1:
+        md.append(f"\n**WARNING: the files behind these tables ran on {len(cpus)} CPU models ({'; '.join(cpus)}).** A strategy row built from several jobs mixes them; the table `CPU models behind each strategy row` says which rows do. Compare strategies within one CPU model, or treat cross-model differences as unmeasured.\n")
+    else:
+        md.append("\nAll files ran on one CPU model.\n")
 
     md.append("## Registry and truth\n")
     rows = []
@@ -489,9 +548,12 @@ def analyze(run_dirs: list[str], out_dir: str) -> None:
     col_group("Races and delay", races)
     col_group("Rate-controlled, timing and order-dependent flakes", rates)
 
+    md.append("### CPU models behind each strategy row\n")
+    md.append(md_table(["strategy", "CPU model(s)", "mixed"], [[s_, "; ".join(sorted(b.src[s_])), "YES" if len(b.src[s_]) > 1 else ""] for s_ in b.order]))
+    md.append("")
     md.append("## Cost per strategy (one CI invocation of the strategy)\n")
-    md.append("Wall seconds are the mean over the runs; `measured` when the strategy itself ran, `modeled` when derived from the measured full-suite pass time x N (S2, S9, S8) or from the measured repeat job. Billed minutes: runners x ceil((set-up + wall)/60), modeled. Runners: parallel jobs the strategy needs (S7 reads the history of runs that exist anyway: 0 marginal).\n")
-    md.append("| strategy | wall s | billed min | runners | set-up s |\n|---|---|---|---|---|")
+    md.append("Wall seconds are the mean over the runs; `measured` when the strategy itself ran, `modeled` when derived from the measured full-suite pass time x N (S2, S9, S8) or from the measured repeat job. Billed minutes: runners x ceil((set-up + wall)/60), modeled; the set-up is that of the job file the strategy came from and it dominates a sub-second wall, so compare strategies on the two wall columns, not on billed minutes. Runners: parallel jobs the strategy needs (S7 reads the history of runs that exist anyway: 0 marginal).\n")
+    md.append("| strategy | wall s (work only) | wall s incl. set-up | billed min | runners | set-up s (of the job file) |\n|---|---|---|---|---|---|")
     for s in b.order:
         md.append(f"| {s} {cost_row(b, s)}")
     md.append("")
@@ -531,7 +593,7 @@ def analyze(run_dirs: list[str], out_dir: str) -> None:
 
     # S7 detail
     md.append("\n## S7 history scoring: detection and false positives against the window K\n")
-    md.append("The history is the per-test run sequence of the pool (each run is one CI run of that test). A window of the last K runs is scored; windows are disjoint. Rules: mixed = a pass and a failure in the window; flips>=2; Beta-Binomial: flag when P(p > theta | window) >= 0.9, with a uniform prior and theta 0.02, or with a Beta(0.1, 20) prior (mean 0.5%, about 20 pseudo-runs) and theta 0.005. A flat prior flags a window with no failure when K is small and theta is small; the informative prior does not, and its strength is a choice, not a measurement. A deterministically failing test is not `mixed` (it is failing, not flaky) but is flagged by the Beta rules.\n")
+    md.append("The history is the per-test run sequence of the pool (each run is one CI run of that test). A window of the last K runs is scored; windows are disjoint. Rules: mixed = a pass and a failure in the window; flips>=2; Beta-Binomial: flag when P(p > theta | window) >= 0.9, with a uniform prior and theta 0.02, or with a Beta(0.1, 20) prior (mean 0.5%, about 20 pseudo-runs) and theta 0.005. A flat prior flags a window with no failure when K is small and theta is small; the informative prior does not, and its strength is a choice, not a measurement. This table can only flag what a rule's threshold allows: beta(1,1) with theta 0.02 cannot flag a 1% flake at any K (read it as a rule for rates above 2%), and history rules need K runs of history that a new test does not have. A deterministically failing test is not `mixed` (it is failing, not flaky) but is flagged by the Beta rules.\n")
     runs_pool = [d for d in runs if d["pool"]]
     seqs: dict[str, str] = {}
     for d in runs_pool:
@@ -586,9 +648,10 @@ def analyze(run_dirs: list[str], out_dir: str) -> None:
         md.append(md_table(["arm", "failures/runs"], tr_rows))
     cal = [(o, d) for d in runs for o in d["calib"]]
     if cal:
-        md.append("\n## Timing-race calibration (margin against failure rate)\n")
-        rows = [[r["arm"], str(r["margin_ms"]), fmt(r["fails"], r["n"])] for o, _ in cal for r in o["rows"]]
-        md.append(md_table(["arm", "margin ms", "failures/runs"], rows))
+        md.append(NL + "## Timing-race calibration (margin against failure rate)" + NL)
+        md.append("Each margin was run as a pool with a few micro tests interleaved, as in the noise pools. The noise job runs it on its own machine and then uses the margin whose stress100 rate is closest to 5%; the `chosen` line says which. CPU is the CPU of the job that ran the sweep." + NL)
+        rows = [[o["_dir"] + "/" + o["_name"], cpu_of(o), r["arm"], str(r["margin_ms"]), fmt(r["fails"], r["n"]), o.get("chosen", "")] for o, _ in cal for r in o["rows"]]
+        md.append(md_table(["file", "CPU", "arm", "margin ms", "failures/runs", "chosen"], rows))
     # canary
     can = [c for d in runs for c in d["canary"]]
     if can:
@@ -598,7 +661,7 @@ def analyze(run_dirs: list[str], out_dir: str) -> None:
             cpu = [r["cpu_ms"] for r in c["rows"]]
             qq = [r["query_ms"] for r in c["rows"]]
             if cpu:
-                rows.append([c["name"], str(len(cpu)), f"{statistics.median(cpu):.1f} / {max(cpu):.1f}", f"{statistics.median(qq):.2f} / {max(qq):.2f}"])
+                rows.append([c["dir"] + "/" + c["name"], str(len(cpu)), f"{statistics.median(cpu):.1f} / {max(cpu):.1f}", f"{statistics.median(qq):.2f} / {max(qq):.2f}"])
         md.append(md_table(["file", "samples", "cpu ms median / max", "query ms median / max"], rows))
         md.append("\nSamples taken while a noise arm is active show the load. A canary far from its own median in an arm without noise means the run overlapped a disturbance and should be discarded.\n")
     # pytest cost

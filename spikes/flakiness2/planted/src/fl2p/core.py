@@ -7,11 +7,11 @@ A planted test is an async callable `fn(ctx)` that raises on failure. Each carri
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 import random
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -49,6 +49,7 @@ def reg(name: str, kind: str, truth: Any, engine: str, variant: str, fn: Callabl
 class Ctx:
     forced: bool = False
     state: dict[str, Any] = field(default_factory=dict)  # process-wide state shared by the tests of one run (order-dependence)
+    val: dict[str, float] = field(default_factory=dict)  # numbers a test records about its own run (stored with the pool)
 
     def urand(self) -> float:
         """One uniform draw from a generator seeded from os.urandom, fresh for every call."""
@@ -63,6 +64,7 @@ class Res:
     ok: bool
     dur: float
     err: str = ""
+    val: dict[str, float] = field(default_factory=dict)
 
 
 _LOOP: asyncio.AbstractEventLoop | None = None
@@ -80,11 +82,11 @@ def run_one(t: T, ctx: Ctx) -> Res:
     t0 = time.perf_counter()
     try:
         loop().run_until_complete(t.fn(ctx))
-        return Res(True, time.perf_counter() - t0)
+        return Res(True, time.perf_counter() - t0, "", dict(ctx.val))
     except BaseException as e:  # noqa: BLE001
         if isinstance(e, (KeyboardInterrupt, SystemExit)):
             raise
-        return Res(False, time.perf_counter() - t0, f"{type(e).__name__}: {str(e)[:100]}")
+        return Res(False, time.perf_counter() - t0, f"{type(e).__name__}: {str(e)[:100]}", dict(ctx.val))
 
 
 def selected(sel: str | None = None, engine: tuple[str, ...] = ("none", "inmem")) -> list[T]:
@@ -111,11 +113,11 @@ def arm(name: str):
     """base | cpus2 | stress<L> | cpus2+stress<L> | jitter.
 
     cpus2 pins this process (and stress-ng) to two cores: an emulation of a 2 vCPU runner on a 4 vCPU one, not the real thing.
-    stress<L> starts stress-ng with one cpu worker per allowed core at L percent load. jitter turns on asyncio debug and
-    blocks the loop for 0 to 2 ms at random intervals."""
+    stress<L> starts stress-ng with one cpu worker per allowed core at L percent load. jitter starts a thread that holds the GIL
+    for 0 to 3 ms at random intervals (scheduling perturbation between the loop and worker threads)."""
     procs: list[subprocess.Popen] = []
     old_aff = None
-    jit = {"on": False}
+    jit: dict[str, Any] = {"on": False}
     parts = [p for p in name.split("+") if p != "base"]
     try:
         for p in parts:
@@ -136,23 +138,25 @@ def arm(name: str):
                 time.sleep(1.0)
             if p == "jitter":
                 jit["on"] = True
-                lp = loop()
-                lp.set_debug(True)
-                lp.slow_callback_duration = 1e6
-                logging.getLogger("asyncio").setLevel(logging.CRITICAL)
                 rnd = random.Random(os.urandom(8))
 
-                def block() -> None:
-                    if jit["on"]:
+                def hog() -> None:
+                    # a thread that holds the GIL for 0 to 3 ms and sleeps 0 to 2 ms, so the loop thread and any worker thread
+                    # compete for the interpreter at random moments (a scheduling perturbation, not CPU load)
+                    while jit["on"]:
+                        end = time.perf_counter() + rnd.random() * 0.003
+                        while time.perf_counter() < end:
+                            pass
                         time.sleep(rnd.random() * 0.002)
-                        lp.call_later(rnd.random() * 0.003, block)
 
-                lp.call_soon(block)
+                th = threading.Thread(target=hog, daemon=True)
+                th.start()
+                jit["th"] = th
         yield
     finally:
         jit["on"] = False
-        if _LOOP is not None and not _LOOP.is_closed():
-            _LOOP.set_debug(False)
+        if jit.get("th") is not None:
+            jit["th"].join(2)
         for pr in procs:
             pr.terminate()
         for pr in procs:

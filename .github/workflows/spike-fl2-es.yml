@@ -1,6 +1,7 @@
 name: spike-fl2-es
-# Refresh, visibility, ordering and race experiments on Elasticsearch and OpenSearch. One job per group, one matrix cell per image,
-# each cell with its own runner and engine container. Also called by spike-fl2-es-smoke.
+# Refresh, visibility, ordering and race experiments on Elasticsearch and OpenSearch. One job per group; the matrix has one cell per
+# engine family, and a cell runs its images one after the other on the same runner (same CPU), in random order, one engine container at a
+# time, with one artifact per image. Also called by spike-fl2-es-smoke.
 on:
   workflow_dispatch:
     inputs:
@@ -46,16 +47,38 @@ defaults:
     shell: bash
     working-directory: spikes/flakiness2/es
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: .
+    outputs:
+      cells: ${{ steps.p.outputs.cells }}
+    steps:
+      - id: p
+        env:
+          IMAGES: ${{ inputs.images }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          imgs = json.loads(os.environ["IMAGES"])
+          cells = []
+          for fam in ("es", "os"):
+              xs = [i for i in imgs if i.startswith(fam)]
+              if xs:
+                  cells.append({"fam": fam, "imgs": " ".join(xs), "a": xs[0], "b": xs[1] if len(xs) > 1 else ""})
+          print("cells=" + json.dumps(cells))
+          PY
   start:
     if: inputs.group == 'start'
+    needs: plan
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
-        image: ${{ fromJSON(inputs.images) }}
-    env:
-      FL2_IMAGE: ${{ matrix.image }}
+        cell: ${{ fromJSON(needs.plan.outputs.cells) }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: pipx install uv==0.11.26 && uv python install 3.12 && uv sync
@@ -65,31 +88,43 @@ jobs:
           sudo sysctl -w vm.max_map_count=262144
           { grep -m1 'model name' /proc/cpuinfo; nproc; free -m | head -2; df -h / | tail -1; docker --version; echo "$ImageOS $ImageVersion"; sysctl vm.max_map_count; } | tee results/machine.txt
       - name: Cold start stages
-        run: uv run python bench.py start ${{ inputs.n }} results/start.json
-        timeout-minutes: 30
-      - name: Finish
-        if: always()
+        env:
+          IMGS: ${{ matrix.cell.imgs }}
         run: |
-          mkdir -p results
-          C=$(docker ps -a --format '{{.Names}}' | grep '^hoodie-fl2-' | head -1 || true)
-          if [ -n "$C" ]; then docker logs "$C" 2>&1 | tail -n 300 > results/engine.log || true; fi
-          uv run python bench.py down || true
+          export FL2_SEED=$(date +%s)
+          rc=0
+          for img in $(shuf -e $IMGS); do
+          export FL2_IMAGE=$img
+          mkdir -p "results/$img"; cp results/machine.txt "results/$img/"
+          uv run python bench.py start ${{ inputs.n }} "results/$img/start.json" || rc=1
+          uv run python bench.py down
+          done
+          exit $rc
+        timeout-minutes: 60
+      - name: Remove engine containers
+        if: always()
+        run: docker rm -f hoodie-fl2-es hoodie-fl2-os >/dev/null 2>&1 || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
-          name: fl2-es-${{ inputs.occasion }}-start-${{ matrix.image }}
-          path: spikes/flakiness2/es/results
+          name: fl2-es-${{ inputs.occasion }}-start-${{ matrix.cell.a }}
+          path: spikes/flakiness2/es/results/${{ matrix.cell.a }}
+          retention-days: 90
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always() && matrix.cell.b != ''
+        with:
+          name: fl2-es-${{ inputs.occasion }}-start-${{ matrix.cell.b }}
+          path: spikes/flakiness2/es/results/${{ matrix.cell.b }}
           retention-days: 90
   lag:
     if: inputs.group == 'lag'
+    needs: plan
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
-        image: ${{ fromJSON(inputs.images) }}
-    env:
-      FL2_IMAGE: ${{ matrix.image }}
+        cell: ${{ fromJSON(needs.plan.outputs.cells) }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: pipx install uv==0.11.26 && uv python install 3.12 && uv sync
@@ -98,34 +133,46 @@ jobs:
           mkdir -p results
           sudo sysctl -w vm.max_map_count=262144
           { grep -m1 'model name' /proc/cpuinfo; nproc; free -m | head -2; df -h / | tail -1; docker --version; echo "$ImageOS $ImageVersion"; sysctl vm.max_map_count; } | tee results/machine.txt
-      - name: Start engine
-        run: uv run python bench.py up
       - name: Write-to-searchable and delete-to-total lag
-        run: uv run python bench.py lag ${{ inputs.n }} results/lag.json
-        timeout-minutes: 100
-      - name: Finish
-        if: always()
+        env:
+          IMGS: ${{ matrix.cell.imgs }}
         run: |
-          mkdir -p results
-          C=$(docker ps -a --format '{{.Names}}' | grep '^hoodie-fl2-' | head -1 || true)
-          if [ -n "$C" ]; then docker logs "$C" 2>&1 | tail -n 300 > results/engine.log || true; fi
-          uv run python bench.py down || true
+          export FL2_SEED=$(date +%s)
+          rc=0
+          for img in $(shuf -e $IMGS); do
+          export FL2_IMAGE=$img
+          mkdir -p "results/$img"; cp results/machine.txt "results/$img/"
+          uv run python bench.py up || { rc=1; continue; }
+          uv run python bench.py lag ${{ inputs.n }} "results/$img/lag.json" || rc=1
+          uv run python bench.py savelog "results/$img" || true
+          uv run python bench.py down
+          done
+          exit $rc
+        timeout-minutes: 270
+      - name: Remove engine containers
+        if: always()
+        run: docker rm -f hoodie-fl2-es hoodie-fl2-os >/dev/null 2>&1 || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
-          name: fl2-es-${{ inputs.occasion }}-lag-${{ matrix.image }}
-          path: spikes/flakiness2/es/results
+          name: fl2-es-${{ inputs.occasion }}-lag-${{ matrix.cell.a }}
+          path: spikes/flakiness2/es/results/${{ matrix.cell.a }}
+          retention-days: 90
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always() && matrix.cell.b != ''
+        with:
+          name: fl2-es-${{ inputs.occasion }}-lag-${{ matrix.cell.b }}
+          path: spikes/flakiness2/es/results/${{ matrix.cell.b }}
           retention-days: 90
   stale:
     if: inputs.group == 'stale'
+    needs: plan
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
-        image: ${{ fromJSON(inputs.images) }}
-    env:
-      FL2_IMAGE: ${{ matrix.image }}
+        cell: ${{ fromJSON(needs.plan.outputs.cells) }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: pipx install uv==0.11.26 && uv python install 3.12 && uv sync
@@ -134,34 +181,46 @@ jobs:
           mkdir -p results
           sudo sysctl -w vm.max_map_count=262144
           { grep -m1 'model name' /proc/cpuinfo; nproc; free -m | head -2; df -h / | tail -1; docker --version; echo "$ImageOS $ImageVersion"; sysctl vm.max_map_count; } | tee results/machine.txt
-      - name: Start engine
-        run: uv run python bench.py up
       - name: Stale total after a delete
-        run: uv run python bench.py stale ${{ inputs.n }} results/stale.json
-        timeout-minutes: 70
-      - name: Finish
-        if: always()
+        env:
+          IMGS: ${{ matrix.cell.imgs }}
         run: |
-          mkdir -p results
-          C=$(docker ps -a --format '{{.Names}}' | grep '^hoodie-fl2-' | head -1 || true)
-          if [ -n "$C" ]; then docker logs "$C" 2>&1 | tail -n 300 > results/engine.log || true; fi
-          uv run python bench.py down || true
+          export FL2_SEED=$(date +%s)
+          rc=0
+          for img in $(shuf -e $IMGS); do
+          export FL2_IMAGE=$img
+          mkdir -p "results/$img"; cp results/machine.txt "results/$img/"
+          uv run python bench.py up || { rc=1; continue; }
+          uv run python bench.py stale ${{ inputs.n }} "results/$img/stale.json" || rc=1
+          uv run python bench.py savelog "results/$img" || true
+          uv run python bench.py down
+          done
+          exit $rc
+        timeout-minutes: 150
+      - name: Remove engine containers
+        if: always()
+        run: docker rm -f hoodie-fl2-es hoodie-fl2-os >/dev/null 2>&1 || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
-          name: fl2-es-${{ inputs.occasion }}-stale-${{ matrix.image }}
-          path: spikes/flakiness2/es/results
+          name: fl2-es-${{ inputs.occasion }}-stale-${{ matrix.cell.a }}
+          path: spikes/flakiness2/es/results/${{ matrix.cell.a }}
+          retention-days: 90
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always() && matrix.cell.b != ''
+        with:
+          name: fl2-es-${{ inputs.occasion }}-stale-${{ matrix.cell.b }}
+          path: spikes/flakiness2/es/results/${{ matrix.cell.b }}
           retention-days: 90
   ties:
     if: inputs.group == 'ties'
+    needs: plan
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
-        image: ${{ fromJSON(inputs.images) }}
-    env:
-      FL2_IMAGE: ${{ matrix.image }}
+        cell: ${{ fromJSON(needs.plan.outputs.cells) }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: pipx install uv==0.11.26 && uv python install 3.12 && uv sync
@@ -170,34 +229,46 @@ jobs:
           mkdir -p results
           sudo sysctl -w vm.max_map_count=262144
           { grep -m1 'model name' /proc/cpuinfo; nproc; free -m | head -2; df -h / | tail -1; docker --version; echo "$ImageOS $ImageVersion"; sysctl vm.max_map_count; } | tee results/machine.txt
-      - name: Start engine
-        run: uv run python bench.py up
       - name: Tie order over index builds
-        run: uv run python bench.py ties ${{ inputs.n }} results/ties.json
-        timeout-minutes: 40
-      - name: Finish
-        if: always()
+        env:
+          IMGS: ${{ matrix.cell.imgs }}
         run: |
-          mkdir -p results
-          C=$(docker ps -a --format '{{.Names}}' | grep '^hoodie-fl2-' | head -1 || true)
-          if [ -n "$C" ]; then docker logs "$C" 2>&1 | tail -n 300 > results/engine.log || true; fi
-          uv run python bench.py down || true
+          export FL2_SEED=$(date +%s)
+          rc=0
+          for img in $(shuf -e $IMGS); do
+          export FL2_IMAGE=$img
+          mkdir -p "results/$img"; cp results/machine.txt "results/$img/"
+          uv run python bench.py up || { rc=1; continue; }
+          uv run python bench.py ties ${{ inputs.n }} "results/$img/ties.json" || rc=1
+          uv run python bench.py savelog "results/$img" || true
+          uv run python bench.py down
+          done
+          exit $rc
+        timeout-minutes: 120
+      - name: Remove engine containers
+        if: always()
+        run: docker rm -f hoodie-fl2-es hoodie-fl2-os >/dev/null 2>&1 || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
-          name: fl2-es-${{ inputs.occasion }}-ties-${{ matrix.image }}
-          path: spikes/flakiness2/es/results
+          name: fl2-es-${{ inputs.occasion }}-ties-${{ matrix.cell.a }}
+          path: spikes/flakiness2/es/results/${{ matrix.cell.a }}
+          retention-days: 90
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always() && matrix.cell.b != ''
+        with:
+          name: fl2-es-${{ inputs.occasion }}-ties-${{ matrix.cell.b }}
+          path: spikes/flakiness2/es/results/${{ matrix.cell.b }}
           retention-days: 90
   races:
     if: inputs.group == 'races'
+    needs: plan
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
-        image: ${{ fromJSON(inputs.images) }}
-    env:
-      FL2_IMAGE: ${{ matrix.image }}
+        cell: ${{ fromJSON(needs.plan.outputs.cells) }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: pipx install uv==0.11.26 && uv python install 3.12 && uv sync
@@ -206,34 +277,46 @@ jobs:
           mkdir -p results
           sudo sysctl -w vm.max_map_count=262144
           { grep -m1 'model name' /proc/cpuinfo; nproc; free -m | head -2; df -h / | tail -1; docker --version; echo "$ImageOS $ImageVersion"; sysctl vm.max_map_count; } | tee results/machine.txt
-      - name: Start engine
-        run: uv run python bench.py up
       - name: Race forcing tests
-        run: uv run python bench.py races ${{ inputs.n }} results/races.json
-        timeout-minutes: 70
-      - name: Finish
-        if: always()
+        env:
+          IMGS: ${{ matrix.cell.imgs }}
         run: |
-          mkdir -p results
-          C=$(docker ps -a --format '{{.Names}}' | grep '^hoodie-fl2-' | head -1 || true)
-          if [ -n "$C" ]; then docker logs "$C" 2>&1 | tail -n 300 > results/engine.log || true; fi
-          uv run python bench.py down || true
+          export FL2_SEED=$(date +%s)
+          rc=0
+          for img in $(shuf -e $IMGS); do
+          export FL2_IMAGE=$img
+          mkdir -p "results/$img"; cp results/machine.txt "results/$img/"
+          uv run python bench.py up || { rc=1; continue; }
+          uv run python bench.py races ${{ inputs.n }} "results/$img/races.json" || rc=1
+          uv run python bench.py savelog "results/$img" || true
+          uv run python bench.py down
+          done
+          exit $rc
+        timeout-minutes: 150
+      - name: Remove engine containers
+        if: always()
+        run: docker rm -f hoodie-fl2-es hoodie-fl2-os >/dev/null 2>&1 || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
-          name: fl2-es-${{ inputs.occasion }}-races-${{ matrix.image }}
-          path: spikes/flakiness2/es/results
+          name: fl2-es-${{ inputs.occasion }}-races-${{ matrix.cell.a }}
+          path: spikes/flakiness2/es/results/${{ matrix.cell.a }}
+          retention-days: 90
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always() && matrix.cell.b != ''
+        with:
+          name: fl2-es-${{ inputs.occasion }}-races-${{ matrix.cell.b }}
+          path: spikes/flakiness2/es/results/${{ matrix.cell.b }}
           retention-days: 90
   stress:
     if: inputs.group == 'stress'
+    needs: plan
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
-        image: ${{ fromJSON(inputs.images) }}
-    env:
-      FL2_IMAGE: ${{ matrix.image }}
+        cell: ${{ fromJSON(needs.plan.outputs.cells) }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: pipx install uv==0.11.26 && uv python install 3.12 && uv sync
@@ -242,21 +325,34 @@ jobs:
           mkdir -p results
           sudo sysctl -w vm.max_map_count=262144
           { grep -m1 'model name' /proc/cpuinfo; nproc; free -m | head -2; df -h / | tail -1; docker --version; echo "$ImageOS $ImageVersion"; sysctl vm.max_map_count; } | tee results/machine.txt
-      - name: Start engine
-        run: uv run python bench.py up
       - name: Stress subset with several workers
-        run: uv run python bench.py stress ${{ inputs.n }} results/stress.json
-        timeout-minutes: 70
-      - name: Finish
-        if: always()
+        env:
+          IMGS: ${{ matrix.cell.imgs }}
         run: |
-          mkdir -p results
-          C=$(docker ps -a --format '{{.Names}}' | grep '^hoodie-fl2-' | head -1 || true)
-          if [ -n "$C" ]; then docker logs "$C" 2>&1 | tail -n 300 > results/engine.log || true; fi
-          uv run python bench.py down || true
+          export FL2_SEED=$(date +%s)
+          rc=0
+          for img in $(shuf -e $IMGS); do
+          export FL2_IMAGE=$img
+          mkdir -p "results/$img"; cp results/machine.txt "results/$img/"
+          uv run python bench.py up || { rc=1; continue; }
+          uv run python bench.py stress ${{ inputs.n }} "results/$img/stress.json" || rc=1
+          uv run python bench.py savelog "results/$img" || true
+          uv run python bench.py down
+          done
+          exit $rc
+        timeout-minutes: 120
+      - name: Remove engine containers
+        if: always()
+        run: docker rm -f hoodie-fl2-es hoodie-fl2-os >/dev/null 2>&1 || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
-          name: fl2-es-${{ inputs.occasion }}-stress-${{ matrix.image }}
-          path: spikes/flakiness2/es/results
+          name: fl2-es-${{ inputs.occasion }}-stress-${{ matrix.cell.a }}
+          path: spikes/flakiness2/es/results/${{ matrix.cell.a }}
+          retention-days: 90
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always() && matrix.cell.b != ''
+        with:
+          name: fl2-es-${{ inputs.occasion }}-stress-${{ matrix.cell.b }}
+          path: spikes/flakiness2/es/results/${{ matrix.cell.b }}
           retention-days: 90

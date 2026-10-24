@@ -53,10 +53,40 @@ async def after_run() -> None:
 
 
 async def r_settle(ctx: Ctx, bound: float) -> None:
+    """One write, settle with the given bound. Records the harness's own timing in ctx.val (seconds, from the engine sync call
+    that follows the data commit): `pre` first probe, `seen` probe that saw the document, `window` start of the last probe.
+    The bound counts sleeps between probes, not wall time, and not from the commit, so `window` is larger than the bound."""
     env = await renv()
     n = nxt()
     env.rt.timeouts = Timeouts(sync=bound, index_build=60.0)
-    await mk(Item, n * 10000, f"u{n} word").insert()
+    t: dict[str, float] = {}
+    spy = env.spy
+    o_probe, o_sync = spy.probe, spy.sync_write
+
+    async def probe(entity, index, pairs):
+        now = time.perf_counter()
+        t.setdefault("first", now)
+        t["last"] = now
+        out = await o_probe(entity, index, pairs)
+        if out:
+            t.setdefault("seen", time.perf_counter())
+        return out
+
+    async def sync_write(entity, index, docs):
+        t["sync"] = time.perf_counter()
+        return await o_sync(entity, index, docs)
+
+    spy.probe, spy.sync_write = probe, sync_write
+    try:
+        await mk(Item, n * 10000, f"u{n} word").insert()
+    finally:
+        spy.__dict__.pop("probe", None)
+        spy.__dict__.pop("sync_write", None)
+        if "sync" in t:
+            ctx.val["pre"] = t.get("first", t["sync"]) - t["sync"]
+            ctx.val["window"] = t.get("last", t["sync"]) - t["sync"]
+            if "seen" in t:
+                ctx.val["seen"] = t["seen"] - t["sync"]
 
 
 async def r_stale(ctx: Ctx, fixed: bool) -> None:
@@ -176,10 +206,10 @@ def _rr(name, kind, truth, fn, variant, **kw):
     reg(name, kind, truth, "real", variant, fn, cost="slow", **kw)
 
 
-for _b in (1.0, 1.01, 1.02):
+for _b in (0.9, 0.95, 1.0, 1.01, 1.02):
     _rr(f"r-settle-b{_b:.2f}", "real-race", "measured", partial(r_settle, bound=_b), "buggy", note=f"one write, settle bound {_b} s on the real engine")
 _rr("r-settle-b4.00", "real-race", 0.0, partial(r_settle, bound=4.0), "fixed", note="bound 4.0 s; expected never to fail, rate measured")
-for _b in (1.0, 1.01, 1.02):
+for _b in (0.9, 0.95, 1.0, 1.01, 1.02):
     _rr(f"r-tx-partial-b{_b:.2f}", "real-race", "measured", partial(r_tx, bound=_b), "buggy", note=f"scenario s14 with bound {_b} s")
 _rr("r-tx-partial-b4.00", "real-race", 0.0, partial(r_tx, bound=4.0), "fixed", note="scenario s14 with bound 4.0 s (the suite's own value)")
 _rr("r-stale-total", "real-race", "measured", partial(r_stale, fixed=False), "buggy", note="delete then exact total at once")
@@ -193,12 +223,12 @@ _rr("r-tie-order-fixed", "real-race", 0.0, partial(r_tie, fixed=True), "fixed")
 
 POST = {"r-tie-order": after_tie, "r-tie-order-fixed": after_tie}
 # default pool size per real test at full scale (runs); the slowest are smaller
-FULL_N = {"r-settle-b1.00": 1000, "r-settle-b1.01": 1000, "r-settle-b1.02": 1000, "r-settle-b4.00": 600,
+FULL_N = {"r-settle-b0.90": 600, "r-settle-b0.95": 600, "r-tx-partial-b0.90": 300, "r-tx-partial-b0.95": 300, "r-settle-b1.00": 1000, "r-settle-b1.01": 1000, "r-settle-b1.02": 1000, "r-settle-b4.00": 600,
           "r-tx-partial-b1.00": 500, "r-tx-partial-b1.01": 500, "r-tx-partial-b1.02": 500, "r-tx-partial-b4.00": 300,
           "r-stale-total": 500, "r-stale-total-fixed": 300, "r-purge-probe": 500, "r-purge-probe-fixed": 300,
           "r-reset-order": 300, "r-reset-order-fixed": 200, "r-tie-order": 100, "r-tie-order-fixed": 60}
 SHARDS = {
-    "settle": ["r-settle-b1.00", "r-settle-b1.01", "r-settle-b1.02", "r-settle-b4.00", "r-tie-order", "r-tie-order-fixed"],
-    "tx": ["r-tx-partial-b1.00", "r-tx-partial-b1.01", "r-tx-partial-b1.02", "r-tx-partial-b4.00"],
+    "settle": ["r-settle-b0.90", "r-settle-b0.95", "r-settle-b1.00", "r-settle-b1.01", "r-settle-b1.02", "r-settle-b4.00", "r-tie-order", "r-tie-order-fixed"],
+    "tx": ["r-tx-partial-b0.90", "r-tx-partial-b0.95", "r-tx-partial-b1.00", "r-tx-partial-b1.01", "r-tx-partial-b1.02", "r-tx-partial-b4.00"],
     "purge": ["r-stale-total", "r-stale-total-fixed", "r-purge-probe", "r-purge-probe-fixed", "r-reset-order", "r-reset-order-fixed"],
 }

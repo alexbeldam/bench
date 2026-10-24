@@ -5,11 +5,11 @@
   stale   stale total after a delete: default settings, refresh=true, wait_for, refresh_interval -1, idle shard
   ties    tie order of equal-score hits over index builds, after force merge, against explicit tiebreakers
   races   can each race be forced on this engine, with a small test and a success count
-  stress  write/delete/purge/reset tests with several workers, failures per test
+  stress  write/delete/purge/reset tests with several workers, failures per test, stall samples
 
-Usage: python bench.py up | down | ref
+Usage: python bench.py up | down | ref | savelog DIR
        python bench.py start|lag|stale|ties|races|stress N OUT     (FL2_IMAGE selects the image id, see IMAGES)
-Environment: FL2_IMAGE (es-9.5.5), FL2_CONTAINER, FL2_PORT, FL2_CPUS (3), FL2_MEM (10g), FL2_HEAP (4g), FL2_SEED, FL2_WORKERS (4)
+Environment: FL2_IMAGE (es-9.5.5), FL2_CONTAINER, FL2_PORT, FL2_CPUS (3), FL2_MEM (10g), FL2_HEAP (4g), FL2_SEED, FL2_WORKERS (4), FL2_JITTER (1.0 s)
 """
 import hashlib
 import json
@@ -18,6 +18,7 @@ import platform
 import random
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -37,6 +38,8 @@ PORT = os.environ.get("FL2_PORT", "29201" if ES else "29202")
 CPUS, MEM, HEAP = os.environ.get("FL2_CPUS", "3"), os.environ.get("FL2_MEM", "10g"), os.environ.get("FL2_HEAP", "4g")
 SEED = int(os.environ.get("FL2_SEED", str(int(time.time()))))
 WORKERS = int(os.environ.get("FL2_WORKERS", "4"))
+JIT = float(os.environ.get("FL2_JITTER", "1.0"))
+RND = random.Random(SEED + 1)
 MAP = {"properties": {"title": {"type": "text"}, "ref": {"type": "keyword"}, "tenant": {"type": "keyword"}, "rev": {"type": "integer"}}}
 BOUND = 30.0
 
@@ -57,15 +60,25 @@ def sh(*a):
     return subprocess.run(["docker", *a], capture_output=True, text=True)
 
 
+def jit():
+    """Random pause so that a write or delete lands at a random phase of the refresh tick."""
+    time.sleep(RND.random() * JIT)
+
+
 # ---- client --------------------------------------------------------------------------------------------------------
 
 
 class Eng:
     def __init__(self, timeout=60):
         self.c = httpx.Client(base_url=f"http://127.0.0.1:{PORT}", timeout=timeout, limits=httpx.Limits(max_connections=64))
+        self.slow = []
 
     def __call__(self, method, path, body=None, **params):
+        t0, w0 = time.perf_counter(), time.time()
         r = self.c.request(method, path, json=body, params={k: v for k, v in params.items() if v is not None})
+        d = time.perf_counter() - t0
+        if d > (3.0 if params.get("refresh") == "wait_for" else 1.5):
+            self.slow.append({"t": round(w0, 3), "secs": round(d, 3), "op": f"{method} {path.split('/_', 1)[-1][:40]}", "status": r.status_code})
         try:
             j = r.json()
         except ValueError:
@@ -108,6 +121,11 @@ def wait(e, idx, key, ok, bound=BOUND):
         time.sleep(0.01)
 
 
+def refreshes(e, idx):
+    s, j = e("GET", f"/{idx}/_stats/refresh")
+    return j["_all"]["total"]["refresh"]["total"] if s == 200 else -1
+
+
 def put_docs(e, idx, ids, title, refresh=None, **extra):
     ops = []
     for i in ids:
@@ -132,7 +150,7 @@ def meta():
     ins = sh("image", "inspect", REF, "--format", "{{.Id}} {{.Size}} {{json .RepoDigests}}").stdout.strip()
     m = {"image_id": ID, "image": REF, "inspect": ins, "cpu_model": cpu, "nproc": os.cpu_count(),
          "runner_image": f"{os.environ.get('ImageOS', '')} {os.environ.get('ImageVersion', '')}".strip(),
-         "docker": sh("--version").stdout.strip(), "limits": {"cpus": CPUS, "mem": MEM, "heap": HEAP}, "seed": SEED, "python": platform.python_version()}
+         "docker": sh("--version").stdout.strip(), "limits": {"cpus": CPUS, "mem": MEM, "heap": HEAP}, "seed": SEED, "jitter_s": JIT, "python": platform.python_version()}
     try:
         m["max_map_count"] = open("/proc/sys/vm/max_map_count").read().strip()
     except OSError:
@@ -183,11 +201,23 @@ def down():
     sh("rm", "-f", C)
 
 
+GC_LOG = "/usr/share/elasticsearch/logs/gc.log" if ES else "/usr/share/opensearch/logs/gc.log"
+
+
+def savelog(d):
+    """Engine stdout tail and the JVM GC log tail of the running (or stopped) container."""
+    os.makedirs(d, exist_ok=True)
+    lg = sh("logs", "--tail", "300", C)
+    open(os.path.join(d, "engine.log"), "w", encoding="utf-8").write(lg.stdout + lg.stderr)
+    g = sh("exec", C, "tail", "-n", "600", GC_LOG)
+    open(os.path.join(d, "gc.log"), "w", encoding="utf-8").write(g.stdout or g.stderr)
+
+
 # ---- start ---------------------------------------------------------------------------------------------------------
 
 
 def start(n, out):
-    r = {"meta": None, "cold_starts": []}
+    r, logs = {"meta": None, "cold_starts": []}, []
     present = sh("image", "inspect", REF).returncode == 0
     t = time.perf_counter()
     p = sh("pull", REF)
@@ -226,11 +256,13 @@ def start(n, out):
             st["first_index_and_search"] = now()
         except (httpx.HTTPError, RuntimeError) as ex:
             st["error"] = f"{type(ex).__name__} {str(ex)[:200]}"
-        if k == 0:
-            r["meta"] = meta()
+        st["meta"] = meta()
         r["cold_starts"].append(st)
+        lg = sh("logs", "--tail", "150", C)
+        logs.append(f"==== cold start {k}\n{lg.stdout}{lg.stderr}")
         sh("rm", "-f", C)
-    r["meta"] = r["meta"] or meta()
+    open(os.path.join(os.path.dirname(out) or ".", "engine.log"), "w", encoding="utf-8").write("\n".join(logs))
+    r["meta"] = r["cold_starts"][-1].get("meta") or meta()
     for key in ("docker_run_returned", "http_answer", "cluster_yellow_or_green", "first_index_and_search"):
         r[f"{key}_s"] = summ([s.get(key) for s in r["cold_starts"]])
     return r
@@ -256,6 +288,7 @@ def lag(n, out):
         o = {k: [] for k in ("write_call", "write_to_searchable", "write_total", "delete_call", "delete_to_total_zero", "delete_total")}
         for k in range(1, n + 1):
             key = f"tok{k}x"
+            jit()
             t0 = time.perf_counter()
             s, j = e("PUT", f"/{idx}/_doc/{key}", {"title": f"{key} word"}, refresh=par)
             assert s in (200, 201), j
@@ -267,6 +300,7 @@ def lag(n, out):
             o["write_call"].append(t1 - t0)
             o["write_to_searchable"].append(None if w is None else t2 - t1)
             o["write_total"].append(None if w is None else t2 - t0)
+            jit()
             t0 = time.perf_counter()
             s, j = e("DELETE", f"/{idx}/_doc/{key}", refresh=par)
             assert s == 200, j
@@ -293,11 +327,12 @@ def stale(n, out):
     ids = [f"s{i:03d}" for i in range(50)]
     arms = [("plain_default", {}, None, 0), ("refresh_true", {}, "true", 0), ("wait_for", {}, "wait_for", 0),
             ("ri_off", {"refresh_interval": "-1"}, None, 0), ("idle_default_idle_after_1s", {"search.idle.after": "1s"}, None, 2.2),
-            ("idle_explicit_ri_1s", {"search.idle.after": "1s", "refresh_interval": "1s"}, None, 2.2)]
+            ("idle_explicit_ri_1s", {"search.idle.after": "1s", "refresh_interval": "1s"}, None, 2.2),
+            ("idle_default_30s", {}, None, 31)]
     random.Random(SEED).shuffle(arms)
     r["order"] = [a[0] for a in arms]
     for name, settings, par, idle in arms:
-        reps = min(n, 60) if idle else n
+        reps = (min(n, 10) if idle > 10 else min(n, 60)) if idle else n
         idx = "fl2stale-" + name.replace("_", "-")
         rm(e, idx)
         mk(e, idx, settings=settings)
@@ -307,10 +342,12 @@ def stale(n, out):
             assert wait(e, idx, "common", lambda v: v == 50) is not None
             if idle:
                 time.sleep(idle)
+            jit()
+            rc0 = refreshes(e, idx)
             t = time.perf_counter()
             del_docs(e, idx, ids, refresh=par)
             first = count(e, idx, "common")
-            run = {"total_right_after": first}
+            run = {"total_right_after": first, "refreshes_during_delete_and_first_search": refreshes(e, idx) - rc0}
             if name == "ri_off":
                 run["count_api"] = e("POST", f"/{idx}/_count", {"query": {"match": {"title": "common"}}})[1].get("count")
                 run["get_by_id_status"] = e("GET", f"/{idx}/_doc/{ids[0]}")[0]
@@ -318,6 +355,7 @@ def stale(n, out):
                 run["total_after_1_5s"] = count(e, idx, "common")
                 e("POST", f"/{idx}/_refresh")
             else:
+                time.sleep(0.1)
                 run["second_total"] = count(e, idx, "common")
                 run["converge_s"] = None
                 if first:
@@ -333,9 +371,10 @@ def stale(n, out):
             a["count_api_stale"] = f"{sum(x['count_api'] != 0 for x in runs)}/{reps}"
             a["get_by_id_statuses"] = sorted({x["get_by_id_status"] for x in runs})
         else:
-            a["still_stale_second_query"] = f"{sum(x['second_total'] != 0 for x in runs)}/{reps}"
+            a["still_stale_after_100ms"] = f"{sum(x['second_total'] != 0 for x in runs)}/{reps}"
+            a["first_search_refreshed_shard"] = f"{sum(x['refreshes_during_delete_and_first_search'] > 0 for x in runs)}/{reps}"
             a["converge_s"] = summ([x["converge_s"] for x in runs])
-        a["runs_head"] = runs[:3]
+        a["runs"] = runs if idle else runs[:3]
         r["arms"][name] = a
         rm(e, idx)
     return r
@@ -353,7 +392,12 @@ def ties(n, out):
     sorted_hash = hashlib.md5(",".join(ids).encode()).hexdigest()[:10]
     base = {"query": {"match": {"title": "alpha"}}, "size": DOCS, "track_total_hits": True}
     arms = {"native": {}, "dfs_native": {"_params": {"search_type": "dfs_query_then_fetch"}}, "score_ref": {"sort": [{"_score": "desc"}, {"ref": "asc"}]},
+            "dfs_score_ref": {"sort": [{"_score": "desc"}, {"ref": "asc"}], "_params": {"search_type": "dfs_query_then_fetch"}}, "ref_only": {"sort": [{"ref": "asc"}]},
             "score_id": {"sort": [{"_score": "desc"}, {"_id": "asc"}]}, "score_doc": {"sort": [{"_score": "desc"}, {"_doc": "asc"}]}}
+
+    def load(idx, seq):
+        for i in range(0, DOCS, 30):
+            put_docs(e, idx, seq[i:i + 30], "alpha beta", refresh="true")
 
     def fill(idx, shards, order, src):
         mk(e, idx, shards)
@@ -364,8 +408,22 @@ def ties(n, out):
         seq = list(ids)
         if order == "shuffled":
             rnd.shuffle(seq)
-        for i in range(0, DOCS, 30):
-            put_docs(e, idx, seq[i:i + 30], "alpha beta", refresh="true")
+        load(idx, seq)
+
+    def source(shards, kind):
+        name = f"fl2ties-src-{shards}-{kind}".replace("_", "-")
+        rm(e, name)
+        mk(e, name, shards)
+        seq = list(ids)
+        if kind == "reversed":
+            seq.reverse()
+        elif kind.startswith("shuffled"):
+            random.Random(SEED + (10 if kind.startswith("shuffled_a") else 11)).shuffle(seq)
+        load(name, seq)
+        if kind.endswith("merged"):
+            e("POST", f"/{name}/_forcemerge", max_num_segments=1)
+            e("POST", f"/{name}/_refresh")
+        return name
 
     def hits(s, j):
         if s != 200:
@@ -386,39 +444,41 @@ def ties(n, out):
         e("DELETE", "/_pit", {"id": pid}) if ES else e("DELETE", "/_search/point_in_time", {"pit_id": [pid]})
         return res
 
+    nb = r["builds_per_config"]
+    plan = []
     for shards in (1, 3):
-        for order in ("fixed", "shuffled", "reindex"):
-            cfg = f"shards{shards}_{order}"
-            res = {p: {a: {"hashes": [], "errors": set(), "scores": set()} for a in [*arms, "pit_shard_doc"]} for p in ("after_build", "after_forcemerge")}
-            changed, src = 0, f"fl2ties-src-{shards}"
-            if order == "reindex":
-                rm(e, src)
-                fill(src, shards, "shuffled", None)
-            for b in range(r["builds_per_config"]):
-                idx = f"fl2ties-{cfg}-{b}".replace("_", "-")
-                fill(idx, shards, order, src)
-                native = {}
-                for phase in ("after_build", "after_forcemerge"):
-                    if phase == "after_forcemerge":
-                        e("POST", f"/{idx}/_forcemerge", max_num_segments=1)
-                        e("POST", f"/{idx}/_refresh")
-                    for a, body in [*arms.items(), ("pit_shard_doc", None)]:
-                        got, info = pit(idx) if body is None else search(idx, body)
-                        cell = res[phase][a]
-                        if got is None:
-                            cell["errors"].add(info)
-                            continue
-                        cell["hashes"].append(hashlib.md5(",".join(got).encode()).hexdigest()[:10])
-                        cell["scores"].add(info)
-                    native[phase] = res[phase]["native"]["hashes"][-1:]
-                changed += native["after_build"] != native["after_forcemerge"]
-                rm(e, idx)
+        plan += [(f"shards{shards}_{o}", shards, o, None, nb) for o in ("fixed", "shuffled")]
+        plan += [(f"shards{shards}_reindex_{k}", shards, "reindex", k, max(2, nb // 3)) for k in ("sorted", "reversed", "shuffled_a", "shuffled_b", "shuffled_a_merged")]
+    for cfg, shards, order, kind, builds in plan:
+        res = {p: {a: {"hashes": [], "errors": set(), "scores": set()} for a in [*arms, "pit_shard_doc"]} for p in ("after_build", "after_forcemerge")}
+        changed = 0
+        src = source(shards, kind) if kind else None
+        for b in range(builds):
+            idx = f"fl2ties-{cfg}-{b}".replace("_", "-")
+            fill(idx, shards, order, src)
+            native = {}
+            for phase in ("after_build", "after_forcemerge"):
+                if phase == "after_forcemerge":
+                    e("POST", f"/{idx}/_forcemerge", max_num_segments=1)
+                    e("POST", f"/{idx}/_refresh")
+                for a, body in [*arms.items(), ("pit_shard_doc", None)]:
+                    got, info = pit(idx) if body is None else search(idx, body)
+                    cell = res[phase][a]
+                    if got is None:
+                        cell["errors"].add(info)
+                        continue
+                    cell["hashes"].append(hashlib.md5(",".join(got).encode()).hexdigest()[:10])
+                    cell["scores"].add(info)
+                native[phase] = res[phase]["native"]["hashes"][-1:]
+            changed += native["after_build"] != native["after_forcemerge"]
+            rm(e, idx)
+        if src:
             rm(e, src)
-            r["configs"][cfg] = {"native_changed_by_forcemerge": f"{changed}/{r['builds_per_config']}", "sorted_ids_hash": sorted_hash, "phases": {
-                p: {a: {"builds_ok": len(c["hashes"]), "distinct_orders": len(set(c["hashes"])), "equals_sorted_ids": sum(h == sorted_hash for h in c["hashes"]),
-                        "distinct_score_counts_per_search": sorted(map(str, c["scores"])), "errors": sorted(c["errors"])} for a, c in cells.items()}
-                for p, cells in res.items()}}
-            print(cfg, r["configs"][cfg]["native_changed_by_forcemerge"], flush=True)
+        r["configs"][cfg] = {"builds": builds, "native_changed_by_forcemerge": f"{changed}/{builds}", "sorted_ids_hash": sorted_hash, "phases": {
+            p: {a: {"builds_ok": len(c["hashes"]), "distinct_orders": len(set(c["hashes"])), "equals_sorted_ids": sum(h == sorted_hash for h in c["hashes"]),
+                    "distinct_score_counts_per_search": sorted(map(str, c["scores"])), "errors": sorted(c["errors"])} for a, c in cells.items()}
+            for p, cells in res.items()}}
+        print(cfg, r["configs"][cfg]["native_changed_by_forcemerge"], flush=True)
     return r
 
 
@@ -441,6 +501,7 @@ def races(n, out):
         for _ in range(n):
             put_docs(e, idx, ids, "tok common", refresh="true")
             assert wait(e, idx, "common", lambda v: v == 20) is not None
+            jit()
             del_docs(e, idx, ids, refresh=par)
             ok += count(e, idx, "common") != 0
             e("POST", f"/{idx}/_refresh")
@@ -492,19 +553,23 @@ def races(n, out):
     add("reset order: delete then recreate at once (old documents survive or create fails)", "DELETE index, PUT same name at once, count", ok_a)
     add("reset order: late writer auto-creates the index with dynamic mapping", "DELETE index, single write by id, then PUT with the intended mapping", ok_b)
     # 4 settle bound equal to the latency
-    arms = {}
-    for ri, bound in (("1s", 0.5), ("1s", 1.0), ("1s", 1.2), ("100ms", 0.1), ("100ms", 0.15)):
+    arms, lags = {}, {}
+    for ri, bounds in (("1s", (0.5, 1.0, 1.2)), ("100ms", (0.1, 0.15))):
         idx = f"fl2r4-{ri}"
         rm(e, idx)
         mk(e, idx, settings={"refresh_interval": ri})
         e("PUT", f"/{idx}/_doc/seed", {"title": "seed"}, refresh="true")
-        miss = 0
+        xs = []
         for k in range(n):
             key = f"set{k}x"
+            jit()
             e("PUT", f"/{idx}/_doc/{key}", {"title": key})
-            miss += wait(e, idx, key, lambda v: v >= 1, bound) is None
-        arms[f"refresh_interval {ri}, bound {bound}s"] = f"{miss}/{n} not settled"
+            xs.append(wait(e, idx, key, lambda v: v >= 1))
+        lags[ri] = summ(xs)
+        for bound in bounds:
+            arms[f"refresh_interval {ri}, bound {bound}s"] = f"{sum(x is None or x > bound for x in xs)}/{n} not settled"
         rm(e, idx)
+    r["settle_lag_s"] = lags
     add("settle bound equal to the refresh interval", "write, poll every 10 ms with a bound at or below the interval",
         sum(int(v.split("/")[0]) for v in arms.values()), "arms give timeouts per bound; the count is summed over arms", arms, total=n * len(arms))
     # 5 partial failure
@@ -530,6 +595,7 @@ def races(n, out):
         mk(e, idx)
         ok = 0
         for k in range(m):
+            jit()
             e("PUT", f"/{idx}/_doc/x{k}", {"title": f"tok rev{k}", "rev": 1}, refresh=par)
             e("PUT", f"/{idx}/_doc/x{k}", {"title": f"tok rev{k}", "rev": 2})
             t, seen = time.perf_counter(), False
@@ -622,10 +688,53 @@ def t_naive_write(e, idx):
 TESTS = [t_write_wait, t_write_wait_for, t_delete_total, t_delete_wait_for, t_purge, t_reset, t_naive_delete, t_naive_write]
 
 
+def cgroup():
+    r = sh("exec", C, "cat", "/sys/fs/cgroup/cpu.stat")
+    d = dict(l.split() for l in r.stdout.splitlines() if len(l.split()) == 2)
+    return {"throttled": int(d.get("nr_throttled", -1)), "throttled_ms": int(d.get("throttled_usec", -1)) // 1000}
+
+
+def sample(e):
+    t = time.time()
+    o = {"t": round(t, 3)}
+    try:
+        s, j = e("GET", "/_nodes/stats/jvm,thread_pool")
+        n = next(iter(j["nodes"].values()))
+        o["heap_pct"] = n["jvm"]["mem"]["heap_used_percent"]
+        o["gc"] = {k: [v["collection_count"], v["collection_time_in_millis"]] for k, v in n["jvm"]["gc"]["collectors"].items()}
+        o["pool"] = {k: [v["queue"], v["rejected"]] for k, v in n["thread_pool"].items() if k in ("write", "search", "management", "snapshot")}
+        s, j = e("GET", "/_cluster/health")
+        o["pending"] = [j["number_of_pending_tasks"], j["task_max_waiting_in_queue_millis"]]
+        o["cgroup"] = cgroup()
+    except (httpx.HTTPError, KeyError, StopIteration, ValueError) as ex:
+        o["error"] = type(ex).__name__
+    o["took"] = round(time.time() - t, 3)
+    return o
+
+
+def stalls(slow, samples):
+    out = []
+    for x in slow:
+        a, b = x["t"], x["t"] + x["secs"]
+        w = [s for s in samples if a - 1.5 <= s["t"] <= b + 1.5 and "gc" in s]
+        if len(w) < 2:
+            out.append({**x, "samples": len(w)})
+            continue
+        gc = sum(v[1] for v in w[-1]["gc"].values()) - sum(v[1] for v in w[0]["gc"].values())
+        out.append({**x, "samples": len(w), "gc_ms": gc, "heap_pct_max": max(s["heap_pct"] for s in w),
+                    "throttled_ms": w[-1]["cgroup"]["throttled_ms"] - w[0]["cgroup"]["throttled_ms"],
+                    "pending_max": max(s["pending"][0] for s in w), "pending_wait_ms_max": max(s["pending"][1] for s in w),
+                    "rejected": sum(v[1] for v in w[-1]["pool"].values()) - sum(v[1] for v in w[0]["pool"].values()),
+                    "sample_gap_s_max": max(w[i + 1]["t"] - w[i]["t"] for i in range(len(w) - 1))})
+    return out
+
+
 def stress(n, out):
     reps = max(1, n // 10)
     e, r = Eng(120), {"meta": meta(), "repeats": reps, "workers": WORKERS, "bound_s": SB, "tests": {}}
     res = {t.__name__: {"runs": 0, "failures": 0, "messages": {}, "secs": []} for t in TESTS}
+    log, samples, stop = [], [], threading.Event()
+    r["runs_log"] = log
 
     def work(a):
         rep, w = a
@@ -633,7 +742,7 @@ def stress(n, out):
         random.Random(SEED + rep * 100 + w).shuffle(order)
         for t in order:
             idx = f"fl2s-{rep}-{w}-{t.__name__[2:]}".replace("_", "-")
-            s, msg = time.perf_counter(), None
+            s, msg, w0 = time.perf_counter(), None, time.time()
             try:
                 t(e, idx)
             except AssertionError as ex:
@@ -642,16 +751,33 @@ def stress(n, out):
                 msg = f"{type(ex).__name__} {str(ex)[:100]}"
             c = res[t.__name__]
             c["runs"] += 1
-            c["secs"].append(time.perf_counter() - s)
+            d = time.perf_counter() - s
+            c["secs"].append(d)
+            log.append([round(w0, 3), round(d, 3), t.__name__[2:], rep, w, msg])
             if msg:
                 c["failures"] += 1
                 c["messages"][msg] = c["messages"].get(msg, 0) + 1
             rm(e, idx)
 
+    def sampler():
+        se = Eng(10)
+        while not stop.is_set():
+            samples.append(sample(se))
+            stop.wait(1.0)
+
+    th = threading.Thread(target=sampler, daemon=True)
+    r["started_at"] = round(time.time(), 3)
+    th.start()
     with ThreadPoolExecutor(WORKERS) as ex:
         list(ex.map(work, [(rep, w) for rep in range(reps) for w in range(WORKERS)]))
+    stop.set()
+    th.join(10)
+    r["ended_at"] = round(time.time(), 3)
     for k, c in res.items():
         r["tests"][k] = {"runs": c["runs"], "failures": c["failures"], "messages": c["messages"], "secs": summ(c["secs"])}
+    r["slow_ops"] = stalls(e.slow, samples)
+    r["samples"] = samples
+    r["sample_took_s"] = summ([x["took"] for x in samples])
     return r
 
 
@@ -667,6 +793,8 @@ if __name__ == "__main__":
         down()
     elif cmd == "ref":
         print(REF)
+    elif cmd == "savelog":
+        savelog(sys.argv[2])
     else:
         res = GROUPS[cmd](int(sys.argv[2]), sys.argv[3])
         res["group"] = cmd
@@ -674,7 +802,9 @@ if __name__ == "__main__":
         brief = json.loads(json.dumps(res, default=str))
         for v in brief.get("variants", {}).values():
             v.pop("raw", None)
+        brief.pop("samples", None)
+        brief.pop("runs_log", None)
         for v in brief.get("arms", {}).values():
-            v.pop("runs_head", None)
+            v.pop("runs", None)
         brief.pop("meta", None)
         print(json.dumps(brief, indent=1)[:6000])

@@ -44,10 +44,20 @@ def warm(tests: list[T]) -> dict[str, float]:
     return out
 
 
-def pool_sizes(tests: list[T], n: int, budget_s: float, n_min: int = 100) -> dict[str, int]:
-    """n runs per test, reduced where n runs would exceed the time budget for that test (never below n_min, never above n)."""
+def is_det(t: T) -> bool:
+    """A deterministic bug (truth 1.0) or the fixed variant of one: these tests fail or pass every run, so they get their own budget."""
+    return t.truth == 1.0 or (t.variant == "fixed" and t.name.endswith("-fixed") and getattr(REG.get(t.name[:-6]), "truth", None) == 1.0)
+
+
+def pool_sizes(tests: list[T], n: int, budget_s: float, n_min: int = 100, det_budget_s: float | None = None) -> dict[str, int]:
+    """n runs per test, reduced where n runs would exceed the time budget for that test (never below n_min, never above n).
+    Deterministic tests use det_budget_s when given."""
     est = warm(tests)
-    return {t.name: max(min(n, n_min), min(n, int(budget_s / max(est[t.name], 1e-5)))) for t in tests}
+    out = {}
+    for t in tests:
+        bud = det_budget_s if (det_budget_s is not None and is_det(t)) else budget_s
+        out[t.name] = max(min(n, n_min), min(n, int(bud / max(est[t.name], 1e-5))))
+    return out
 
 
 def pool(tests: list[T], sizes: dict[str, int], seed: int) -> dict[str, Any]:
@@ -94,11 +104,10 @@ def suite_exps(strategy: str, k: int, seed: int, passes: int = 1, tests: list[T]
     tests = [t for t in tests if t.engine in ("none", "inmem")]
     out = []
     for i in range(k):
-        state: dict[str, Any] = {}
         ps = []
         for _ in range(passes):
             os_ = None if strategy == "s0" else int.from_bytes(os.urandom(4), "big")
-            ps.append(suite_pass(tests, os_, state))
+            ps.append(suite_pass(tests, os_, {}))  # one pass = one process: fresh state
         out.append({"i": i, "passes": [{"order_seed": p["order_seed"], "fail": p["fail"], "wall_s": p["wall_s"]} for p in ps],
                     "wall_s": sum(p["wall_s"] for p in ps)})
     return out
@@ -155,7 +164,7 @@ def cmd_pool(a: Any) -> None:
             nm, n = spec.split("=")
             extra[nm] = int(n)
     with arm(a.arm):
-        sizes = pool_sizes(tests, a.n, a.budget)
+        sizes = pool_sizes(tests, a.n, a.budget, det_budget_s=getattr(a, "det_budget", None))
         sizes.update({k: v for k, v in extra.items() if k in sizes})
         print(f"pool arm={a.arm} seed={seed} tests={len(tests)} runs={sum(sizes.values())}", flush=True)
         out = pool(tests, sizes, seed)
@@ -195,4 +204,4 @@ def wilson(x: int, n: int, z: float = 1.959964) -> tuple[float, float]:
     d = 1 + z * z / n
     c = p + z * z / (2 * n)
     h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
-    return ((c - h) / d, (c + h) / d)
+    return (max(0.0, (c - h) / d), min(1.0, (c + h) / d))

@@ -21,7 +21,7 @@ def _init() -> None:
     from . import registry  # noqa: F401  (register the tests in the worker)
 
 
-def _work(name: str) -> tuple[str, bool, float, str, float]:
+def _work(name: str) -> tuple[str, bool, float, str, float, dict]:
     from . import tests_real
     from .core import loop
 
@@ -34,14 +34,14 @@ def _work(name: str) -> tuple[str, bool, float, str, float]:
             loop().run_until_complete(tests_real.after_run())
     except Exception as e:  # noqa: BLE001
         res.err += f" | cleanup {type(e).__name__}"
-    return name, res.ok, res.dur, res.err, time.time()
+    return name, res.ok, res.dur, res.err, time.time(), res.val
 
 
 def real_pool(names: list[str], sizes: dict[str, int], seed: int, workers: int) -> dict[str, Any]:
     order = [nm for nm in names for _ in range(sizes[nm])]
     random.Random(seed).shuffle(order)
     ctx = mp.get_context("spawn")
-    rows: list[tuple[str, bool, float, str, float]] = []
+    rows: list[tuple[str, bool, float, str, float, dict]] = []
     t0 = time.perf_counter()
     with ctx.Pool(workers, initializer=_init) as pool:
         for k, r in enumerate(pool.imap_unordered(_work, order, chunksize=1)):
@@ -60,7 +60,8 @@ def real_pool(names: list[str], sizes: dict[str, int], seed: int, workers: int) 
                 errs[r[3][:70]] = errs.get(r[3][:70], 0) + 1
         tests[nm] = {"label": REG[nm].label(), "n": len(rs), "fail": "".join("0" if r[1] else "1" for r in rs), "errs": errs,
                      "dur_mean": sum(durs) / max(len(durs), 1), "dur_p95": durs[int(0.95 * (len(durs) - 1))] if durs else 0.0,
-                     "dur_sum": sum(durs), "dur_max": durs[-1] if durs else 0.0}
+                     "dur_sum": sum(durs), "dur_max": durs[-1] if durs else 0.0,
+                     "vals": {k: [r[5].get(k) for r in rs] for k in sorted({k for r in rs for k in r[5]})}}
     return {"order_seed": seed, "wall_s": wall, "workers": workers, "tests": tests}
 
 
@@ -89,22 +90,25 @@ def cmd_real(a: Any) -> None:
     if digest:
         os.environ["FL2P_ENGINE_DIGEST"] = digest
     arms = [x for x in a.arms.split(",") if x]
-    print(f"real shard={a.shard} seed={seed} arms={arms} runs/arm={sum(sizes.values())}", flush=True)
-    for ar in arms:
-        sz = sizes if ar == "base" else {nm: max(2, int(sizes[nm] * a.arm_frac)) for nm in names if nm in a.arm_tests.split(",")}
-        if not sz:
-            continue
-        nm_list = list(sz)
+    arm_tests = [x for x in a.arm_tests.split(",") if x and x in names]
+    print(f"real shard={a.shard} seed={seed} arms={arms} runs/base={sum(sizes.values())}", flush=True)
+    plan = ["base"]
+    rest = (["ref"] if arm_tests else []) + [x for x in arms if x != "base"]
+    random.Random(seed + 1).shuffle(rest)  # arm order is shuffled with the logged seed; `ref` = the arm tests again with no noise
+    plan += rest if arm_tests else []
+    print(f"arm order {plan}", flush=True)
+    for ar in plan:
+        sz = sizes if ar == "base" else {nm: max(2, int(sizes[nm] * a.arm_frac)) for nm in arm_tests}
         undo = None
         if ar == "engine1":
             docker("update", "--cpus", "1.0", container)
             undo = lambda: docker("update", "--cpus", os.environ.get("WP_CPUS", "3"), container)  # noqa: E731
         try:
             with arm("stress100" if ar == "stress100" else "base"):
-                out = real_pool(nm_list, sz, seed, a.workers)
+                out = real_pool(list(sz), sz, seed, a.workers)
         finally:
             if undo:
                 undo()
-        out.update(header("real-pool", seed, arm=ar, shard=a.shard, n_scale=a.n_scale))
+        out.update(header("real-pool", seed, arm=ar, shard=a.shard, n_scale=a.n_scale, arm_order=plan))
         dump(f"{a.out_dir}/real-{a.shard}-{ar}.json.gz", out)
         print(f"real arm={ar} wall={out['wall_s']:.0f}s", flush=True)

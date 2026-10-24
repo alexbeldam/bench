@@ -122,6 +122,8 @@ def env_info():
         cpu = next(l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name"))
     except Exception:  # noqa: BLE001
         pass
+    if not cpu:
+        cpu = run(["bash", "-c", "lscpu | grep -m1 'Model name' | cut -d: -f2"]).stdout.strip() or "unknown"
     dig = run(["docker", "image", "inspect", IMAGE, "--format", "{{json .RepoDigests}}"]).stdout.strip()
     return {"image": IMAGE, "digest": dig, "cpu_model": cpu, "nproc": os.cpu_count(), "runner_image": os.environ.get("ImageVersion", ""),
             "cpus_limit": os.environ.get("WP_CPUS", "3"), "mem_limit": os.environ.get("WP_MEM", "10g")}
@@ -172,6 +174,8 @@ def blocks(rng, conds, n):
 
 
 def save(out, r):
+    if "env" in r:
+        r["cpu_model"] = r["env"].get("cpu_model")
     data = json.dumps(r, indent=1)
     if out.endswith(".gz"):
         with gzip.open(out, "wt") as f:
@@ -296,7 +300,8 @@ def discover(c, r):
 
 
 def wait_block(a, ns, timeout=8):
-    """Perf-counter time at which the index process's change-stream cursor on ns has been idle for 50 ms, or None.
+    """Perf-counter time at which the index process's change-stream cursor on ns was first seen idle (and stayed idle
+    for 50 ms), or None; the read was held from about then (or a little earlier).
     Normally its getMore is always in flight (awaitData); idle for that long means the read is held by the fail point."""
     end = now() + timeout
     since = None
@@ -326,6 +331,7 @@ def failcmd_feed(c, r, rng, n):
         try:
             if mode in ("once", "once_ungated"):
                 fp_on(a, ["getMore"], app, t, {"times": 1})
+            b = None
             if mode == "once":
                 a0 = now()
                 b = wait_block(a, "fl_fc_feed.c")
@@ -340,6 +346,9 @@ def failcmd_feed(c, r, rng, n):
             s1 = now()
             v = wait_visible(coll, "i", key, 60)
             row["insert_s"] = round(s1 - s0, 3)
+            if mode == "once" and b is not None:
+                row["write_after_gate_s"] = round(s0 - b, 3)
+                row["lag_from_block_minus_T"] = None if v is None else round(v - b - t, 3)
             if v is None:
                 row["lag"] = None
                 errors.append({"mode": mode, "T": t, "error": "not visible in 60 s"})
@@ -360,6 +369,9 @@ def failcmd_feed(c, r, rng, n):
     r["feed_errors"] = errors
     r["feed_summary"] = {f"{m} T={t}": {"lag": summ([x.get("lag") for x in rows if x["mode"] == m and x["T"] == t]),
                                         "lag_minus_T": summ([x.get("lag_minus_T") for x in rows if x["mode"] == m and x["T"] == t]),
+                                        "lag_from_block_minus_T": summ([x.get("lag_from_block_minus_T") for x in rows if x["mode"] == m and x["T"] == t]),
+                                        "write_after_gate_s": summ([x.get("write_after_gate_s") for x in rows if x["mode"] == m and x["T"] == t]),
+                                        "valid_for_forcing": m == "once" or m == "none",
                                         "block_seen": sum(bool(x.get("block_seen")) for x in rows if x["mode"] == m and x["T"] == t),
                                         "under_T": sum((x.get("lag_minus_T") or 0) < 0 for x in rows if x["mode"] == m and x["T"] == t)}
                          for m, t in conds}
@@ -556,22 +568,31 @@ def toxi_feed(r, rng, n):
                                    "lag_minus_L": summ([x.get("lag_minus_L") for x in rows if x["stream"] == k and x["latency_s"] == L])} for k, L in conds}
     toxic("feed", "dn", "downstream", 0)
     toxic("feed", "up", "upstream", 0)
-    # does anything bypass the proxy: disable it and see whether a write still becomes searchable
-    d["disabled_proxy_check"] = {}
-    try:
-        tp("POST", "/proxies/feed", {"enabled": False})
-        time.sleep(1)
-        key = newkey()
-        coll.insert_one({"title": key})
-        s1 = now()
-        v = wait_visible(coll, "i", key, 12 if not SMOKE else 6)
-        d["disabled_proxy_check"]["searchable_within_bound_while_disabled"] = v is not None
-        d["disabled_proxy_check"]["bound_s"] = 12 if not SMOKE else 6
-        tp("POST", "/proxies/feed", {"enabled": True})
-        v2 = wait_visible(coll, "i", key, 90)
-        d["disabled_proxy_check"]["searchable_after_enable_s"] = None if v2 is None else round(v2 - s1, 2)
-    except Exception as e:  # noqa: BLE001
-        d["disabled_proxy_check"]["error"] = err(e)
+    # does anything bypass the proxy, and how long does the index process take to recover; several samples
+    d["disabled_proxy_check"] = {"samples": []}
+    bound = 12 if not SMOKE else 6
+    d["disabled_proxy_check"]["bound_s"] = bound
+    for k in range(min(max(n, 1), 5)):
+        smp = {}
+        try:
+            tp("POST", "/proxies/feed", {"enabled": False})
+            time.sleep(1)
+            key = newkey()
+            coll.insert_one({"title": key})
+            s1 = now()
+            v = wait_visible(coll, "i", key, bound)
+            smp["searchable_within_bound_while_disabled"] = v is not None
+            tp("POST", "/proxies/feed", {"enabled": True})
+            v2 = wait_visible(coll, "i", key, 120)
+            smp["searchable_after_enable_s"] = None if v2 is None else round(v2 - s1, 2)
+        except Exception as e:  # noqa: BLE001
+            smp["error"] = err(e)
+            try:
+                tp("POST", "/proxies/feed", {"enabled": True})
+            except Exception:  # noqa: BLE001
+                pass
+        d["disabled_proxy_check"]["samples"].append(smp)
+    d["disabled_proxy_check"]["recovery_s"] = summ([x.get("searchable_after_enable_s") for x in d["disabled_proxy_check"]["samples"]])
     cd.drop_database("fl_tf")
     cd.close()
 
@@ -758,19 +779,6 @@ def pause(n, out, seed):
 # ---- ghost ---------------------------------------------------------------------------------------------------------
 
 
-def wait_ready_index(coll, name, bound):
-    end = now() + bound
-    while now() < end:
-        try:
-            for ix in coll.list_search_indexes(name):
-                if ix.get("queryable"):
-                    return True
-        except Exception:  # noqa: BLE001
-            pass
-        time.sleep(0.05)
-    return False
-
-
 def logs_between(t0, t1, pat):
     p = run(["docker", "logs", "--since", f"{t0 - 1:.3f}", "--until", f"{t1 + 1:.3f}", C])
     out = []
@@ -780,10 +788,13 @@ def logs_between(t0, t1, pat):
     return out[:14]
 
 
-def ghost_rep(c, tag, delay, paused, bound, first):
-    """One drop-and-recreate. A new database and index name each time."""
+def ghost_rep(c, tag, delay, paused, bound, first, age=0.0):
+    """One drop-and-recreate. A new database and index name each time.
+    class: stale_ready (old entry still READY and queryable when first listed), listed_dne (listed, status
+    DOES_NOT_EXIST), absent (not listed). The old entry is watched until it is gone, then an index is created under a
+    new name; real_ok is whether a document written after the recreate became searchable through that index."""
     name = f"ix{tag}"
-    row = {"tag": tag, "delay_ms": int(delay * 1000), "mongot_paused": paused, "first_after_fresh_engine": first}
+    row = {"tag": tag, "delay_ms": int(delay * 1000), "mongot_paused": paused, "first_after_fresh_engine": first, "age_s": age}
     db = c[f"fl_g_{tag}"]
     coll = db["c"]
     coll.insert_many([{"title": "x common"} for _ in range(50)])
@@ -793,7 +804,8 @@ def ghost_rep(c, tag, delay, paused, bound, first):
     t_start = time.time()
     make_index(coll, name)
     tq = now()
-    t_drop = None
+    if age:
+        time.sleep(age)
     try:
         if paused:
             sh("kill -STOP " + " ".join(ps))
@@ -802,54 +814,57 @@ def ghost_rep(c, tag, delay, paused, bound, first):
         coll.drop()
         time.sleep(delay)
         db.create_collection("c")
-        t_recreate = now()
     finally:
         if paused:
             sh("kill -CONT " + " ".join(ps))
     t_resume = now()
     coll = db["c"]
-    # watch the old index entry; when it is gone and the new collection has no index, create one under a new name
     name2 = None
     trace = []
-    ok = False
-    via = None
-    row["queryable_within_bound"] = False
+    cls = None
+    gone_at = None
+    row["old_name_searchable_while_ready"] = None
+    q2 = False
     while now() < t_resume + bound:
-        try:
-            st = list(coll.list_search_indexes(name)) if name2 is None else []
-        except Exception as e:  # noqa: BLE001
-            row["list_error"] = err(e)
-            st = None
-        if st is not None:
-            state = (st[0].get("status"), bool(st[0].get("queryable"))) if st else None
-            if not trace or trace[-1][1] != state:
-                trace.append([round(now() - t_resume, 2), state])
-            if st and st[0].get("queryable"):
-                ok, via = True, "old_name"
-                break
-            if not st and name2 is None:
-                name2 = name + "b"
-                coll.create_search_index(SearchIndexModel(definition=DEFN, name=name2))
-                row["new_index_created_after_s"] = round(now() - t_resume, 2)
-        if name2 is not None:
+        if name2 is None:
+            try:
+                lst = list(coll.list_search_indexes(name))
+            except Exception as e:  # noqa: BLE001
+                row["list_error"] = err(e)
+                lst = None
+            if lst is not None:
+                state = (lst[0].get("status"), bool(lst[0].get("queryable"))) if lst else None
+                if not trace or trace[-1][1] != state:
+                    trace.append([round(now() - t_resume, 2), state])
+                if cls is None:
+                    cls = "absent" if not lst else ("stale_ready" if state[1] else "listed_dne")
+                    if cls == "stale_ready":
+                        k = newkey()
+                        coll.insert_one({"title": k})
+                        row["old_name_searchable_while_ready"] = wait_visible(coll, name, k, 3) is not None
+                if not lst:
+                    gone_at = now()
+                    name2 = name + "b"
+                    coll.create_search_index(SearchIndexModel(definition=DEFN, name=name2))
+        else:
             try:
                 if any(ix.get("queryable") for ix in coll.list_search_indexes(name2)):
-                    ok, via = True, "new_name"
+                    q2 = True
                     break
             except Exception:  # noqa: BLE001
                 pass
         time.sleep(0.05)
-    row["old_index_listed_at_resume"] = bool(trace and trace[0][1] is not None)
+    row["class"] = cls
     row["old_index_trace"] = trace[:8]
-    row["queryable_within_bound"] = ok
-    row["via"] = via
-    row["original_ok"] = ok and (via == "old_name" or not row["old_index_listed_at_resume"])
-    row["time_to_queryable_s"] = round(now() - t_resume, 2) if ok else None
+    row["old_gone_after_resume_s"] = None if gone_at is None else round(gone_at - t_resume, 2)
+    row["old_gone_after_drop_s"] = None if gone_at is None else round(gone_at - t_drop, 2)
+    row["new_index_queryable"] = q2
+    row["time_to_queryable_s"] = round(now() - t_resume, 2) if q2 else None
     row["bound_s"] = bound
-    if ok:
+    row["real_ok"] = False
+    if q2:
         coll.insert_one({"title": "post common"})
-        v = wait_visible(coll, name if via == "old_name" else name2, "post", 15)
-        row["searchable_after_recreate"] = v is not None
+        row["real_ok"] = wait_visible(coll, name2, "post", 15) is not None
     row["log"] = logs_between(t_start, time.time(), f"fl_g_{tag}|{name}")
     try:
         c.drop_database(db.name)
@@ -859,67 +874,71 @@ def ghost_rep(c, tag, delay, paused, bound, first):
 
 
 def ghost(n, out, seed, fresh_n, bound):
+    """Fresh arms (a new engine per repetition): delay 0 and 50 ms as the first repetition; delay 0 after idle time;
+    delay 0 after a throwaway repetition. Warm arms (one engine): delays 0..1000 ms, paused, and index age 3 s."""
     rng = random.Random(seed)
     r = {"group": "ghost", "n": n, "fresh_n": fresh_n, "bound_s": bound, "seed": seed, "env": env_info()}
-    delays = (0.0, 0.05, 0.2, 1.0)
-    warm = [(d, p) for d in delays for p in (False, True)]
+    idle = 5.0 if SMOKE else 25.0
+    fresh_conds = [("fresh d=0", 0.0, 0), ("fresh d=50", 0.05, 0), ("fresh_idle d=0", 0.0, idle), ("fresh_throwaway d=0", 0.0, -1)]
+    warm_conds = [(d, False, 0.0) for d in (0.0, 0.05, 0.2, 0.5, 1.0)] + [(0.0, True, 0.0), (1.0, True, 0.0), (0.0, False, 3.0), (0.2, False, 3.0)]
     rows = []
     r["rows"] = rows
     c = cli()
-    # fresh arm: a new engine for every repetition, the repetition is the first thing run after readiness
-    fresh = blocks(rng, list(delays), fresh_n)
-    r["fresh_order_ms"] = [int(d * 1000) for d in fresh]
-    for i, d in enumerate(fresh):
-        arm = f"fresh d={int(d * 1000)}"
+    order = blocks(rng, fresh_conds, fresh_n)
+    r["fresh_order"] = [o[0] for o in order]
+    for i, (arm, d, pre) in enumerate(order):
         try:
             if i:
                 rm(C)
                 start_std()
             c.close()
             c = cli()
+            if pre > 0:
+                time.sleep(pre)
+            elif pre < 0:
+                ghost_rep(c, f"t{i}", 1.0, False, 5, False)
             row = ghost_rep(c, f"f{i}", d, False, bound, True)
         except Exception as e:  # noqa: BLE001
             row = {"error": err(e), "delay_ms": int(d * 1000), "first_after_fresh_engine": True}
+            try:
+                sh("kill -CONT " + " ".join(pids()))
+            except Exception:  # noqa: BLE001
+                pass
         row["arm"] = arm
         rows.append(row)
-        print(arm, row.get("original_ok"), row.get("via"), flush=True)
+        print(arm, row.get("class"), row.get("real_ok"), flush=True)
         save(out, {**r, "rows": rows})
     if fresh_n:
         rm(C)
         start_std()
         c.close()
         c = cli()
-    # warm arm: one engine, randomised block order. A throwaway repetition first so that repetition 1 is not special.
     try:
-        ghost_rep(c, "warmup", 0.0, False, 5, False)
+        ghost_rep(c, "warmup", 1.0, False, 5, False)
     except Exception as e:  # noqa: BLE001
         r["warmup_error"] = err(e)
-    for i, (d, p) in enumerate(blocks(rng, warm, n)):
-        arm = f"warm d={int(d * 1000)} paused={p}"
+    for i, (d, p, age) in enumerate(blocks(rng, warm_conds, n)):
+        arm = f"warm d={int(d * 1000)} paused={p} age={int(age)}"
         try:
-            row = ghost_rep(c, f"w{i}", d, p, bound, False)
+            row = ghost_rep(c, f"w{i}", d, p, bound, False, age)
         except Exception as e:  # noqa: BLE001
             row = {"error": err(e), "delay_ms": int(d * 1000), "mongot_paused": p}
             sh("kill -CONT " + " ".join(pids()))
         row["arm"] = arm
         row["order"] = i
         rows.append(row)
-        print(arm, row.get("original_ok"), row.get("via"), flush=True)
+        print(arm, row.get("class"), row.get("real_ok"), flush=True)
         save(out, {**r, "rows": rows})
-    arms = sorted({x["arm"] for x in rows})
-    r["summary"] = {a: {"n": sum(x["arm"] == a for x in rows), "queryable_incl_recreate": sum(bool(x.get("queryable_within_bound")) for x in rows if x["arm"] == a),
-                        "original_ok": sum(bool(x.get("original_ok")) for x in rows if x["arm"] == a),
-                        "errors": sum("error" in x for x in rows if x["arm"] == a),
-                        "old_index_listed_at_resume": sum(bool(x.get("old_index_listed_at_resume")) for x in rows if x["arm"] == a),
-                        "via_old_name": sum(x.get("via") == "old_name" for x in rows if x["arm"] == a),
-                        "via_new_name": sum(x.get("via") == "new_name" for x in rows if x["arm"] == a),
+    arms = list(dict.fromkeys(x["arm"] for x in rows))
+    r["summary"] = {a: {"n": sum(x["arm"] == a for x in rows), "errors": sum("error" in x for x in rows if x["arm"] == a),
+                        "classes": {k: sum(x.get("class") == k for x in rows if x["arm"] == a) for k in ("stale_ready", "listed_dne", "absent")},
+                        "real_ok": sum(bool(x.get("real_ok")) for x in rows if x["arm"] == a),
+                        "old_name_searchable_while_ready": sum(bool(x.get("old_name_searchable_while_ready")) for x in rows if x["arm"] == a),
+                        "old_gone_after_drop_s": summ([x.get("old_gone_after_drop_s") for x in rows if x["arm"] == a]),
                         "time_to_queryable_s": summ([x.get("time_to_queryable_s") for x in rows if x["arm"] == a])} for a in arms}
-    # what separates the passes from the failures, across all repetitions
-    ok = [x for x in rows if x.get("original_ok")]
-    bad = [x for x in rows if x.get("original_ok") is False]
-    r["passes_vs_failures"] = {"passes": len(ok), "failures": len(bad),
-                               "age_at_drop_s_pass": summ([x.get("age_at_drop_s") for x in ok]), "age_at_drop_s_fail": summ([x.get("age_at_drop_s") for x in bad]),
-                               "uptime_s_pass": summ([x.get("engine_uptime_s") for x in ok]), "uptime_s_fail": summ([x.get("engine_uptime_s") for x in bad])}
+    r["by_class"] = {k: {"n": sum(x.get("class") == k for x in rows), "real_ok": sum(bool(x.get("real_ok")) for x in rows if x.get("class") == k),
+                         "uptime_s": summ([x.get("engine_uptime_s") for x in rows if x.get("class") == k]),
+                         "delay_ms": sorted({x["delay_ms"] for x in rows if x.get("class") == k})} for k in ("stale_ready", "listed_dne", "absent")}
     save(out, r)
     print(json.dumps({k: v for k, v in r.items() if k != "rows"}, indent=1)[:6000])
     c.close()

@@ -86,7 +86,7 @@ jobs:
         run: |
           mkdir -p results/smoke-real
           for s in settle tx purge; do
-            uv run fl2p real --shard "$s" --n-scale smoke --smoke-n 3 --workers 2 --arms base,engine1 --arm-tests r-settle-b1.01,r-tx-partial-b1.02,r-stale-total --arm-frac 1.0 --out-dir results/smoke-real
+            uv run fl2p real --shard "$s" --n-scale smoke --smoke-n 3 --workers 2 --arms base,engine1 --arm-tests r-settle-b1.02,r-tx-partial-b1.02,r-stale-total --arm-frac 1.0 --out-dir results/smoke-real
           done
           uv run fl2p analyze results/smoke-real --out results/smoke-real/report
         timeout-minutes: 20
@@ -152,8 +152,8 @@ jobs:
               if full; then K=30; else K=3; fi
               uv run fl2p forced --k "$K" --out results/forced.json ;;
             noise)
-              if full; then N=1500; B=6; R=5000; K=60; else N=40; B=2; R=60; K=3; fi
-              uv run fl2p noise --arms "base,cpus2,stress50,stress100,cpus2+stress100" --n "$N" --budget "$B" --race-n "$R" --k "$K" $SEEDARG --out-dir results ;;
+              if full; then N=1500; B=6; R=5000; K=60; CN=2000; else N=40; B=2; R=60; K=3; CN=20; fi
+              uv run fl2p noise --arms "base,cpus2,stress50,stress100,cpus2+stress100,jitter" --n "$N" --budget "$B" --race-n "$R" --k "$K" --calib-n "$CN" $SEEDARG --out-dir results ;;
             prop)
               if full; then K=50; E=100; else K=2; E=15; fi
               uv run fl2p prop --k "$K" --examples "$E" --steps 12 $SEEDARG --out results/prop.json ;;
@@ -162,10 +162,9 @@ jobs:
               uv run fl2p repeat --scope function --k "$K" --nmax "$NM" --out results/repeat-function.json
               uv run fl2p repeat --scope session --k "$K" --nmax "$NM" --out results/repeat-session.json ;;
             meta)
-              if full; then NS="1 10 50 100"; RP=3; SD=30; CN=3000; else NS="1 5"; RP=1; SD=3; CN=30; fi
+              if full; then NS="1 10 50 100"; RP=3; SD=30; else NS="1 5"; RP=1; SD=3; fi
               uv run fl2p pytestcost --ns $NS --reps "$RP" $SEEDARG --out results/pytestcost.json
-              uv run fl2p pytestcheck --seeds "$SD" $SEEDARG --out results/pytestcheck.json
-              uv run fl2p calib --arms "base,stress100" --margins "0.25,0.5,1.0,2.0" --n "$CN" --out results/calib.json ;;
+              uv run fl2p pytestcheck --seeds "$SD" $SEEDARG --out results/pytestcheck.json ;;
           esac
       - name: Finish
         if: always()
@@ -215,8 +214,8 @@ jobs:
         run: |
           SEEDARG=""; [ -n "$SEED" ] && SEEDARG="--seed $SEED"
           case "${{ matrix.shard }}" in
-            settle) AT="r-settle-b1.01,r-settle-b1.02"; ARMS="base,engine1,stress100" ;;
-            tx) AT="r-tx-partial-b1.01,r-tx-partial-b1.02"; ARMS="base,engine1,stress100" ;;
+            settle) AT="r-settle-b0.95,r-settle-b1.02"; ARMS="base,engine1,stress100" ;;
+            tx) AT="r-tx-partial-b0.95,r-tx-partial-b1.02"; ARMS="base,engine1,stress100" ;;
             purge) AT=""; ARMS="base" ;;
           esac
           uv run fl2p real --shard "${{ matrix.shard }}" --n-scale "$SCALE" --smoke-n 4 --mult "$MULT" --workers 4 --arms "$ARMS" --arm-tests "$AT" --arm-frac 0.3 $SEEDARG --out-dir results
