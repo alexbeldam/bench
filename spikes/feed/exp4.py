@@ -54,8 +54,14 @@ async def main(kind):
         except PyMongoError as e:
             t_err = time.time()
             errs.append({"t_after_kill_s": round(t_err - killed_at, 2), "type": type(e).__name__, "code": getattr(e, "code", None), "msg": str(e)[:200]})
-            # manual resume with the last event's token, retried every 0.5 s until it works
+            # manual resume with the last event's token, retried every 0.5 s until it works, 20 s at most; the outage ends inside this loop
             while True:
+                if down_until and time.time() > down_until:
+                    px.paused = False
+                    down_until = None
+                if time.time() - t_err > 20:
+                    resumes.append({"gave_up_after_s": 20})
+                    break
                 try:
                     s = await rdb.watch(pipe(COLLS), resume_after=tok, max_await_time_ms=100) if tok else await rdb.watch(pipe(COLLS), max_await_time_ms=100)
                     await s.try_next()
