@@ -20,6 +20,6 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 1
-      - run: spikes/flakiness2/mechanics/harness/env.sh
+      - run: bash spikes/flakiness2/mechanics/harness/env.sh
       - name: Time the changed file lists
         run: python3 spikes/flakiness2/mechanics/harness/diff.py
