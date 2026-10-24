@@ -32,7 +32,7 @@ on:
         description: "Which job group to run"
         type: choice
         default: recreate
-        options: [recreate, hot, size]
+        options: [recreate, hot, size, ids]
       reps:
         description: "Repetitions (recreate and hot)"
         type: string
@@ -127,5 +127,27 @@ jobs:
         if: always()
         with:
           name: spike-probe-${{ inputs.occasion }}-size
+          path: spikes/probe/results
+          retention-days: 90
+  ids:
+    if: inputs.group == 'ids'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: pipx install uv==0.11.26 && uv python install 3.12 && uv sync
+      - run: ../../write-path/scripts/ci-start-engine.sh
+      - name: Probe forms per id type with right and wrong id mappings
+        run: uv run python q1.py
+        timeout-minutes: 90
+      - name: Finish
+        if: always()
+        run: |
+          mkdir -p results; docker logs "$WP_CONTAINER" 2>&1 | tail -n 2000 > results/engine.log || true
+          docker rm -f "$WP_CONTAINER" >/dev/null 2>&1 || true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: spike-probe-${{ inputs.occasion }}-ids
           path: spikes/probe/results
           retention-days: 90

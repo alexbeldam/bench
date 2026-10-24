@@ -9,6 +9,7 @@ Harnesses copied from local spikes. They were written for a laptop and are **unt
 | recreate | delete then recreate under the same id and a new id; rules A (epoch), A2, B (tombstone window), C (nothing) | `reps=2` | `reps=10` | under 1 h |
 | hot | three probe forms (P1 stored copy, P2 index-side range, P3 packed token) with 1 and 5 hot documents at 200 and 1000 writes/s | `reps=1 duration=10` | `reps=3 duration=30` | 1 to 3 h |
 | size | index size and build time per index definition (V0 to V6) | `docs=100000` | `docs=1000000` | 1 to 4 h |
+| ids | the three probe forms per id type (ObjectId, string, UUID, int64 above 2^53) with the right and wrong `_id` mappings: false hits and misses, most documents per query, latency | default | default | under 30 min |
 
 Artifact: `spike-probe-<occasion>-<group>`, raw `q*.json` and `q*.log` plus the engine log tail.
 

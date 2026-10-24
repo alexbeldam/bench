@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [recreate, hot, size]
+        group: [recreate, hot, size, ids]
     uses: ./.github/workflows/spike-probe.yml
     with:
       group: ${{ matrix.group }}
