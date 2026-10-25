@@ -1,0 +1,97 @@
+name: spike-odm
+# Search clauses and a document layer against the search engine container (group engine) or the hosted cluster
+# (group hosted). See spikes/RUNBOOK.md. Every job has its own runner and artifact; hosted jobs run one at a time.
+on:
+  workflow_call:
+    inputs:
+      group:
+        type: string
+        required: true
+      docs:
+        type: string
+        default: "100000"
+      reps:
+        type: string
+        default: "10"
+      occasion:
+        type: string
+        default: "run1"
+  workflow_dispatch:
+    inputs:
+      group:
+        description: "Which job group to run"
+        type: choice
+        default: engine
+        options: [engine, hosted]
+      docs:
+        description: "Documents for the scale check (hosted: the free cluster holds 0.5 GB)"
+        type: string
+        default: "100000"
+      reps:
+        description: "Repetitions per timed query"
+        type: string
+        default: "10"
+      occasion:
+        description: "Label of this occasion, for example run1 (goes into the artifact name)"
+        type: string
+        default: "run1"
+permissions:
+  contents: read
+env:
+  WP_CONTAINER: hoodie-odm-engine
+  WP_PORT: "27300"
+  WP_CPUS: "3"
+  WP_MEM: "10g"
+defaults:
+  run:
+    shell: bash
+    working-directory: spikes/odm-search
+jobs:
+  engine:
+    if: inputs.group == 'engine'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: pipx install uv==0.11.26 && uv python install 3.12 && uv sync
+      - run: ../../write-path/scripts/ci-start-engine.sh
+      - name: Checks against the engine container
+        run: uv run python run.py engine --label "engine-${{ inputs.occasion }}" --docs ${{ inputs.docs }} --reps ${{ inputs.reps }} | tee results-engine.log
+        timeout-minutes: 100
+      - name: Finish
+        if: always()
+        run: |
+          mkdir -p results; mv results-engine.log results/ 2>/dev/null || true
+          docker logs "$WP_CONTAINER" 2>&1 | tail -n 2000 > results/engine.log || true
+          docker rm -f "$WP_CONTAINER" >/dev/null 2>&1 || true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: spike-odm-${{ inputs.occasion }}-engine
+          path: spikes/odm-search/results
+          retention-days: 90
+  hosted:
+    if: inputs.group == 'hosted'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # One hosted-cluster job at a time across every workflow.
+    concurrency:
+      group: m0-cluster
+      cancel-in-progress: false
+    env:
+      HOODIE_BENCH_ATLAS_URL: ${{ secrets.HOODIE_BENCH_ATLAS_URL }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: pipx install uv==0.11.26 && uv python install 3.12 && uv sync
+      - name: Checks against the hosted cluster
+        run: uv run python run.py hosted --label "hosted-${{ inputs.occasion }}" --docs ${{ inputs.docs }} --reps ${{ inputs.reps }} | tee results-hosted.log
+        timeout-minutes: 110
+      - name: Finish
+        if: always()
+        run: mkdir -p results; mv results-hosted.log results/ 2>/dev/null || true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: spike-odm-${{ inputs.occasion }}-hosted
+          path: spikes/odm-search/results
+          retention-days: 90

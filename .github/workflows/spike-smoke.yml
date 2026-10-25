@@ -3,9 +3,9 @@ name: spike-smoke
 # spikes/RUNBOOK.md). Its timings are NOT results.
 on:
   push:
-    paths: ["spikes/probe/**", "spikes/feed/**", "write-path/scripts/**", ".github/workflows/spike-*.yml"]
+    paths: ["spikes/probe/**", "spikes/feed/**", "spikes/odm-search/**", "write-path/scripts/**", ".github/workflows/spike-*.yml"]
   pull_request:
-    paths: ["spikes/probe/**", "spikes/feed/**", "write-path/scripts/**", ".github/workflows/spike-*.yml"]
+    paths: ["spikes/probe/**", "spikes/feed/**", "spikes/odm-search/**", "write-path/scripts/**", ".github/workflows/spike-*.yml"]
 permissions:
   contents: read
 concurrency:
@@ -34,4 +34,11 @@ jobs:
     with:
       group: ${{ matrix.group }}
       trials: "500"
+      occasion: smoke-ci
+  odm:
+    uses: ./.github/workflows/spike-odm.yml
+    with:
+      group: engine
+      docs: "1500"
+      reps: "2"
       occasion: smoke-ci

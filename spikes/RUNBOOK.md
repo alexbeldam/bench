@@ -71,3 +71,13 @@ Dispatch `spike-fl2-planted` with `group` (`inmem`, `real`, `both`), `scale`, `r
 | real purge | stale total, purge probe, reset order, each with its fixed variant | `scale=smoke` | `mult=1.0` | 30 to 45 min |
 
 Artifacts: `fl2-planted-<occasion>-inmem-<family>` and `fl2-planted-<occasion>-real-<shard>` (the matrix value is appended to the group name), 90 days: result JSON (pools gzipped), `machine.txt`, canary JSONL (gzip), `report/tables.md` of that job alone, engine log tail for real jobs. Each job needs its own runner, so each artifact holds one slice; `fl2p analyze` merges the directories. Download with `gh run download <id> -n <artifact> -D results/downloads/<name>` and pass the parent folder, or every artifact folder of one occasion, as one run directory (the analyzer reads all files below it).
+
+## spike-odm (`spikes/odm-search`, search engine image or the hosted cluster)
+
+| group | what | smallest input | real input | expected time |
+|---|---|---|---|---|
+| engine | checks c1 to c8 (see the folder README) on the engine container | `docs=1500 reps=2` | `docs=100000 reps=10` | 20 to 40 min |
+| hosted | the same checks on the hosted cluster (one job at a time, group `m0-cluster`) | `docs=1500 reps=2` | `docs=20000 reps=5` | 20 to 60 min |
+
+Artifact: `spike-odm-<occasion>-engine` or `-hosted`: result JSON, the console log and (engine) the engine log tail. Hosted indexing delays and limits are limits of that tier.
+
