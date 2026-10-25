@@ -2,7 +2,7 @@
 
 Question: how do Atlas Search clauses and a Beanie document layer behave on the engine container and on the hosted cluster, in the places where the engine fails silently or the document layer has its own rules?
 
-One harness (`run.py`), eight checks, each prints rows and writes `results/<label>.json`. An engine error inside a case is an observation; a harness error fails the run.
+One harness (`run.py`), nine checks, each prints rows and writes `results/<label>.json`. An engine error inside a case is an observation; a harness error fails the run.
 
 | check | what it observes |
 |---|---|
@@ -13,6 +13,7 @@ One harness (`run.py`), eight checks, each prints rows and writes `results/<labe
 | c5 | `highlight` through a projection model; `autocomplete`, fuzzy, unmapped path |
 | c6 | saving a document whose link field holds a fetched or constructed document (`save`, `save(link_rule=WRITE)`, `save_changes`) |
 | c7 | an explicit session that is not in a transaction: a write with and without a check before it |
+| c9 | the facet type a field's Python type implies (`str`, number, `datetime`, `list[str]`) against the engine; facets on a wrong type, an undeclared field, a boolean and an unmapped path |
 | c8 | scale: time to searchable, page latency by depth, page consistency (duplicates, order), query against parse time |
 
 Arms: engine container and hosted cluster are separate jobs; compare within one run only. Hosted limits (index count, operations per second, indexing delay) belong to that tier.

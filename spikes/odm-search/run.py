@@ -334,6 +334,69 @@ async def c8(db, a):
     await drop_index(coll, "big_idx", timeout=600)
 
 
+# ------------------------------------------------------------------ c9: the facet type follows from the field type
+class Fct(BaseModel):
+    kind: str
+    qty: int
+    price: float
+    created: dt.datetime
+    flag: bool
+    tags: list[str]
+    plain: str
+
+
+def facet_type(ann):
+    """The rule under test: the facet type a field's Python type implies (None: not facetable)."""
+    if ann is str or ann == list[str]:
+        return "string"
+    if ann in (int, float):
+        return "number"
+    if ann is dt.datetime:
+        return "date"
+    return None
+
+
+async def c9(db, a):
+    c = db["odm_f"]
+    await c.insert_many([{"kind": "abc"[i % 3], "qty": i % 10, "price": i * 0.5, "created": BASE + dt.timedelta(days=i), "flag": i % 2 == 0, "tags": ["x", "y"] if i % 2 else ["z"], "plain": f"p{i}"} for i in range(40)])
+    await make_index(c, "f_idx", {"dynamic": False, "fields": {
+        "_id": {"type": "objectId"}, "kind": [{"type": "token"}, {"type": "stringFacet"}], "qty": [{"type": "number"}, {"type": "numberFacet"}],
+        "price": [{"type": "number"}, {"type": "numberFacet"}], "created": [{"type": "date"}, {"type": "dateFacet"}], "flag": {"type": "boolean"},
+        "tags": {"type": "stringFacet"}, "plain": {"type": "string"}}})
+    await wait_docs(c, "f_idx", 40)
+    opts = {"string": {"numBuckets": 3}, "number": {"boundaries": [0, 5, 10], "default": "other"}, "date": {"boundaries": [BASE, BASE + dt.timedelta(days=20), BASE + dt.timedelta(days=60)]}}
+
+    async def run(path, ftype):
+        r = await agg(c, [{"$searchMeta": {"index": "f_idx", "facet": {"operator": {"exists": {"path": "_id"}}, "facets": {"f": {"type": ftype, "path": path, **opts[ftype]}}}}}])
+        return [(b.get("_id"), b["count"]) for b in r[0]["facet"]["f"]["buckets"]]
+
+    agree = disagree = 0
+    declared = {"kind", "qty", "price", "created", "flag", "tags"}  # fields declared facetable
+    for name, fi in Fct.model_fields.items():
+        want = facet_type(fi.annotation) if name in declared else None
+        if want:
+            try:
+                b = await run(name, want)
+                seen = "ok" if b else "empty"
+            except Exception as e:  # noqa: BLE001
+                b, seen = str(e)[:80], "error"
+            agree, disagree = (agree + 1, disagree) if seen == "ok" else (agree, disagree + 1)
+            row("c9", f"{name}: {fi.annotation} -> {want}", observed=seen, buckets=b)
+        else:
+            row("c9", f"{name}: {fi.annotation} -> not facetable", predicted="definition-time error" if name in declared else "field not declared facetable")
+        await nap()
+    row("c9", "inferred facet types against the engine", agree=agree, disagree=disagree)
+    for label, path, ftype in (("wrong type: string facet on a number field", "qty", "string"), ("wrong type: number facet on a string field", "kind", "number"),
+                               ("field mapped without a facet type (plain string)", "plain", "string"), ("boolean field", "flag", "string"), ("unmapped path", "nope", "string")):
+        try:
+            b = await run(path, ftype)
+            row("c9", label, observed="ok" if b else "empty", buckets=b[:3])
+        except Exception as e:  # noqa: BLE001
+            row("c9", label, observed="error", error=f"{type(e).__name__}: {str(e)[:100]}")
+        await nap()
+    await drop_index(c, "f_idx")
+
+
 async def clean(db):
     for n in await db.list_collection_names():
         if n.startswith("odm_"):
@@ -350,7 +413,7 @@ async def main():
     ap.add_argument("--label", required=True)
     ap.add_argument("--docs", type=int, default=2000)
     ap.add_argument("--reps", type=int, default=5)
-    ap.add_argument("--only", default="c1,c2,c3,c4,c5,c6,c7,c8")
+    ap.add_argument("--only", default="c1,c2,c3,c4,c5,c6,c7,c8,c9")
     a = ap.parse_args()
     HOSTED = a.kind == "hosted"
     only = set(a.only.split(","))
@@ -375,6 +438,7 @@ async def main():
         if "c6" in only: await c6(db, a)
         if "c7" in only: await c7(db, a, cl)
         if "c8" in only: await c8(db, a)
+        if "c9" in only: await c9(db, a)
     except BaseException as e:  # noqa: BLE001
         print("HARNESS ERROR:", redact(f"{type(e).__name__}: {e}"))
         save(a.label, {**meta, "harness_error": redact(f"{type(e).__name__}: {e}")})

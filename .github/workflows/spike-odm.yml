@@ -16,6 +16,9 @@ on:
       occasion:
         type: string
         default: "run1"
+      only:
+        type: string
+        default: "c1,c2,c3,c4,c5,c6,c7,c8,c9"
   workflow_dispatch:
     inputs:
       group:
@@ -35,6 +38,10 @@ on:
         description: "Label of this occasion, for example run1 (goes into the artifact name)"
         type: string
         default: "run1"
+      only:
+        description: "Checks to run, comma separated"
+        type: string
+        default: "c1,c2,c3,c4,c5,c6,c7,c8,c9"
 permissions:
   contents: read
 env:
@@ -56,7 +63,7 @@ jobs:
       - run: pipx install uv==0.11.26 && uv python install 3.12 && uv sync
       - run: ../../write-path/scripts/ci-start-engine.sh
       - name: Checks against the engine container
-        run: uv run python run.py engine --label "engine-${{ inputs.occasion }}" --docs ${{ inputs.docs }} --reps ${{ inputs.reps }} | tee results-engine.log
+        run: uv run python run.py engine --label "engine-${{ inputs.occasion }}" --docs ${{ inputs.docs }} --reps ${{ inputs.reps }} --only ${{ inputs.only }} | tee results-engine.log
         timeout-minutes: 100
       - name: Finish
         if: always()
@@ -84,7 +91,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: pipx install uv==0.11.26 && uv python install 3.12 && uv sync
       - name: Checks against the hosted cluster
-        run: uv run python run.py hosted --label "hosted-${{ inputs.occasion }}" --docs ${{ inputs.docs }} --reps ${{ inputs.reps }} | tee results-hosted.log
+        run: uv run python run.py hosted --label "hosted-${{ inputs.occasion }}" --docs ${{ inputs.docs }} --reps ${{ inputs.reps }} --only ${{ inputs.only }} | tee results-hosted.log
         timeout-minutes: 110
       - name: Finish
         if: always()

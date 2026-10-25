@@ -76,7 +76,7 @@ Artifacts: `fl2-planted-<occasion>-inmem-<family>` and `fl2-planted-<occasion>-r
 
 | group | what | smallest input | real input | expected time |
 |---|---|---|---|---|
-| engine | checks c1 to c8 (see the folder README) on the engine container | `docs=1500 reps=2` | `docs=100000 reps=10` | 20 to 40 min |
+| engine | checks c1 to c9 (`only=` picks some) (see the folder README) on the engine container | `docs=1500 reps=2` | `docs=100000 reps=10` | 20 to 40 min |
 | hosted | the same checks on the hosted cluster (one job at a time, group `m0-cluster`) | `docs=1500 reps=2` | `docs=20000 reps=5` | 20 to 60 min |
 
 Artifact: `spike-odm-<occasion>-engine` or `-hosted`: result JSON, the console log and (engine) the engine log tail. Hosted indexing delays and limits are limits of that tier.
