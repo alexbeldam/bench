@@ -435,7 +435,7 @@ def an_model(d):
             o.append("Total wall including engine start: " + ", ".join(f"{'none' if w == 0 else w}: {med([r['start_s'] + r['pytest_s'] for r in g[w]]):.0f} s" for w in ws if g[w]) + "." + "\n")
     bad = [r for r in rows if r["error"] or r["failed"]]
     if bad:
-        o.append("Errored or failing runs: " + "; ".join(f"{r['id']} pin={r.get('pin', 0)} w={r['workers']} failed={r['failed']} {r['error'][:100]}" for r in bad) + "\n")
+        o.append("Errored or failing runs: " + "; ".join(f"{r['id']} pin={r.get('pin', 0)} w={r['workers']} failed={r.get('failed')} {r['error'][:100]}" for r in bad) + "\n")
     return "\n".join(o)
 
 
