@@ -3,7 +3,7 @@
 usage: python run.py <engine|hosted> --label L [--docs N] [--only c1,c2,...] [--reps R]
 Every check prints rows (check, case, observed values) and writes results/<label>.json. A harness error fails the run;
 an engine error inside a case is an observation."""
-import argparse, asyncio, datetime as dt, platform, secrets, time
+import argparse, asyncio, datetime as dt, os, platform, secrets, time
 
 from beanie import Document, Link, PydanticObjectId, WriteRules, init_beanie
 from beanie.odm.utils.parsing import parse_obj
@@ -334,6 +334,15 @@ async def c8(db, a):
     await drop_index(coll, "big_idx", timeout=600)
 
 
+async def clean(db):
+    for n in await db.list_collection_names():
+        if n.startswith("odm_"):
+            c = db[n]
+            for ix in await (await c.list_search_indexes()).to_list():
+                await drop_index(c, ix["name"])
+            await c.drop()
+
+
 async def main():
     global HOSTED
     ap = argparse.ArgumentParser()
@@ -346,8 +355,10 @@ async def main():
     HOSTED = a.kind == "hosted"
     only = set(a.only.split(","))
     cl = client(a.kind)
-    dbname = f"odm_{secrets.token_hex(4)}"
+    # the hosted user may only touch its own database: use it, and clean up only the collections this harness creates
+    dbname = (os.environ.get("HOODIE_BENCH_ATLAS_DB") or "bench").strip() if HOSTED else f"odm_{secrets.token_hex(4)}"
     db = cl[dbname]
+    await clean(db)
     print(f"kind={a.kind} db={dbname} python={platform.python_version()}")
     meta = {"kind": a.kind, "docs": a.docs, "reps": a.reps, "only": sorted(only), "python": platform.python_version(), "platform": platform.platform()}
     try:
@@ -370,7 +381,7 @@ async def main():
         raise SystemExit(1)
     finally:
         try:
-            await cl.drop_database(dbname)
+            await clean(db)
         finally:
             await cl.close()
     save(a.label, meta)
